@@ -1,0 +1,9 @@
+requests
+sseclient-py
+kafka-python-ng
+pyspark==4.2.0
+streamlit
+pandas
+pyarrow
+psutil
+streamlit-autorefresh

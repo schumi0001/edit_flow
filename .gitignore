@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.cursor/
+.runtime/
+.env
+
+data/*
+!data/.gitkeep
+
+checkpoints/*
+!checkpoints/.gitkeep
+
+*.log
+*.parquet
