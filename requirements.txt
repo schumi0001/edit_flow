@@ -7,3 +7,4 @@ pandas
 pyarrow
 psutil
 streamlit-autorefresh
+scikit-learn

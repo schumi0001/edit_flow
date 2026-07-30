@@ -11,12 +11,17 @@ from pyspark.sql.types import (
 
 KAFKA_SERVER = "localhost:9092"
 KAFKA_TOPIC = "wikipedia-edits"
+KAFKA_PACKAGE = "org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0"
 
 
 spark = (
     SparkSession.builder
     .appName("WikiPulseStream")
-    .master("local[*]")
+    .master("local[2]")
+    .config("spark.jars.packages", KAFKA_PACKAGE)
+    .config("spark.driver.memory", "1g")
+    .config("spark.sql.shuffle.partitions", "4")
+    .config("spark.ui.enabled", "false")
     .getOrCreate()
 )
 
