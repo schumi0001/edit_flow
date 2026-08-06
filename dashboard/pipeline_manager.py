@@ -54,7 +54,8 @@ def is_process_running(process_name):
         return False
 
     pid = info.get("pid")
-    recorded_start_time = info.get("create_time")
+    command = info.get("command") or []
+    script_path = command[-1] if command else None
 
     try:
         process = psutil.Process(pid)
@@ -65,10 +66,17 @@ def is_process_running(process_name):
         if process.status() == psutil.STATUS_ZOMBIE:
             return False
 
-        # Prevent accidentally treating a reused PID as our process.
-        return abs(
-            process.create_time() - recorded_start_time
-        ) < 1
+        # Prevent accidentally treating a reused PID as our process by
+        # checking the launched script path is still part of its cmdline
+        # (works even for launchers like spark-submit that exec into a
+        # different binary under the same PID). We deliberately don't
+        # compare create_time here: this environment's clock drifts by
+        # several seconds within moments of process start, which made
+        # that comparison fail almost immediately and caused the pipeline
+        # to spawn duplicate producer/Spark processes on every restart.
+        return script_path is not None and any(
+            script_path in arg for arg in process.cmdline()
+        )
 
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return False

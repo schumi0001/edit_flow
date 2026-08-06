@@ -1,5 +1,7 @@
 import os
-import joblib
+import sys
+from pathlib import Path
+
 import pandas as pd
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json, window, count, approx_count_distinct, sum, abs, when, pandas_udf
@@ -7,15 +9,19 @@ from pyspark.sql.types import (
     BooleanType, LongType, StringType, StructField, StructType, TimestampType, DoubleType,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from models.model_utils import load_model
+
 KAFKA_SERVER = "localhost:9092"
 KAFKA_INPUT_TOPIC = "wikipedia-edits"
 KAFKA_OUTPUT_TOPIC = "wikipedia-anomalies"
 MODEL_PATH = "models/anomaly_detector.joblib"
 
 # 1. Load the pre-trained model so it is cached in memory
-if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(f"Trained model not found at {MODEL_PATH}. Run train_model.py first.")
-trained_model = joblib.load(MODEL_PATH)
+trained_model = load_model(MODEL_PATH)
 
 spark = (
     SparkSession.builder
@@ -83,7 +89,9 @@ kafka_stream = (
     .format("kafka")
     .option("kafka.bootstrap.servers", KAFKA_SERVER)
     .option("subscribe", KAFKA_INPUT_TOPIC)
+    .option("kafka.group.id", "wikipulse-sklearn-demo")
     .option("startingOffsets", "latest")
+    .option("failOnDataLoss", "false")
     .load()
 )
 

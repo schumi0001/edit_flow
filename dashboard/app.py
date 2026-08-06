@@ -10,6 +10,7 @@ from pipeline_manager import (
     start_pipeline,
     stop_pipeline,
 )
+from anomaly_utils import parse_anomaly_message
 
 # ---------------------------------------------------------
 # Page configuration
@@ -328,6 +329,42 @@ with right_column:
         y_label="User",
     )
 
+
+# ---------------------------------------------------------
+# Anomaly alerts
+# ---------------------------------------------------------
+
+st.subheader("Anomaly alerts")
+
+anomaly_messages = []
+try:
+    from kafka import KafkaConsumer
+
+    consumer = KafkaConsumer(
+        "wikipedia-anomalies",
+        bootstrap_servers="localhost:9092",
+        auto_offset_reset="earliest",
+        consumer_timeout_ms=4000,
+    )
+    anomaly_messages = [
+        parse_anomaly_message(message.value)
+        for message in consumer
+        if parse_anomaly_message(message.value) is not None
+    ]
+    consumer.close()
+except Exception:
+    anomaly_messages = []
+
+if anomaly_messages:
+    anomaly_df = pd.DataFrame(anomaly_messages)
+    anomaly_df = anomaly_df.sort_values(by=["anomaly_score"], ascending=True)
+    st.dataframe(
+        anomaly_df[["page_title", "anomaly_score", "edit_count", "unique_editors", "total_byte_changes"]],
+        hide_index=True,
+        use_container_width=True,
+    )
+else:
+    st.info("No live anomaly alerts have been emitted yet. Start the scorer and feed the live Wikimedia stream to populate this section.")
 
 # ---------------------------------------------------------
 # Largest changes
