@@ -147,17 +147,21 @@ Run the following commands from `/workspaces/edit_flow`.
 docker compose up -d
 ```
 
-**2. Train the offline scikit-learn model** (one-time, or whenever the feature lake changes)
+**2. Train the offline scikit-learn model** (one-time, or whenever you want to refresh the baseline)
 
-From the existing local feature lake:
+First, fetch real historical edits from the MediaWiki `recentchanges` API (one-time, or to refresh):
+```bash
+python scripts/download_wikimedia_history.py
+```
+This writes `data/historical/en.wikipedia.org.recentchanges.jsonl` and trains from it immediately.
+
+To train again later without re-downloading:
 ```bash
 python models/train_model.py
 ```
+This defaults to `data/historical/en.wikipedia.org.recentchanges.jsonl`. Pass `--history-jsonl /path/to/other.jsonl` to train from a different file.
 
-From a historical Wikimedia-style JSONL file (useful when you do not want to leave the live stream running):
-```bash
-python models/train_model.py --history-jsonl /path/to/history.jsonl
-```
+There is also a `--feature-lake` flag that trains from whatever has accumulated in the local `data/lake/features` parquet files (populated by `spark/ml_feature_stream.py` from the live `wikipedia-edits` Kafka topic). This is **not recommended** as a default: that topic can accumulate test/synthetic events published during development, and there's no guarantee the live window covers a representative slice of normal activity.
 
 This trains an Isolation Forest pipeline offline and saves it to `models/anomaly_detector.joblib`.
 
@@ -167,10 +171,11 @@ python spark/ml_inference_stream.py
 ```
 Leave this running. It reads `wikipedia-edits` from Kafka, aggregates events into 15-minute windows, scores each page with the saved scikit-learn model, and writes flagged anomalies to the `wikipedia-anomalies` topic.
 
-**4. Feed it live data**
+**4. Feed it live data** — this is the step that actually publishes to the `wikipedia-edits` Kafka topic that step 3 reads from:
 ```bash
-python spark/wiki_stream.py
+python producer/wikipedia_producer.py
 ```
+Optionally, also run `python spark/wiki_stream.py` alongside it. That script only *reads* `wikipedia-edits` and archives it to Parquet under `data/raw_wikipedia_edits` -- it is not required for anomaly detection and does not feed anything itself, despite the similar name.
 
 **5. Check for flagged anomalies**
 ```bash
@@ -186,4 +191,70 @@ The `wikipedia-anomalies` Kafka topic is the pipeline's actual output — there 
 **6. Dashboard UI**
 ```bash
 python -m streamlit run dashboard/app.py
+```
+
+## Verifying anomalies against real news (vector search)
+
+An anomalous edit spike isn't by itself evidence of anything — it could be
+a real news event driving edits, or vandalism/an edit war/bot activity.
+`vectordb/match_events.py` embeds titles from both `wikipedia-anomalies`
+and `news-topic` (using a local `sentence-transformers` model — no API key),
+storing news embeddings in [Qdrant](https://qdrant.tech/), and for each
+anomaly searches that index for the closest recent match. A cosine
+similarity of at least `SIMILARITY_THRESHOLD` (default `0.7`) is treated as
+confirmation that the anomaly corresponds to a real, concurrent news event.
+
+Both topics currently only carry titles (no article body or edit diff
+text), so this is title-vs-title semantic matching for now — e.g. Wikipedia
+page `2026_California_wildfires` vs. a GDELT article titled "Wildfires
+force evacuations in LA County".
+
+Start Qdrant (it's part of the same Compose file as Kafka):
+```bash
+docker compose up -d qdrant
+```
+
+Then run the verifier alongside `producer/gdelt_producer.py` and the
+anomaly-detection pipeline above (steps 1–4):
+```bash
+python vectordb/match_events.py
+```
+The first run downloads the embedding model (~80MB, needs network); it's
+cached locally after that. Qdrant's own data is persisted in a Docker
+volume, so the news index survives restarts of `match_events.py` itself.
+
+Every evaluated anomaly — matched or not — is published to the
+`verified-events` Kafka topic, keyed by `page_title`:
+
+| Field | Meaning |
+|---|---|
+| `page_title` | The flagged Wikipedia page |
+| `window_start` / `window_end` | The anomaly's 15-minute detection window |
+| `anomaly_score` | Score from `wikipedia-anomalies` |
+| `edit_count` | Edit count from `wikipedia-anomalies` |
+| `matched` | `true` if `similarity_score >= SIMILARITY_THRESHOLD` |
+| `similarity_score` | Best cosine similarity found against recent news, or `null` if the news index was empty |
+| `matched_article` | `{title, url, language, event_id}` of the best-matching article, or `null` if not matched |
+| `evaluated_at` | When this script evaluated the anomaly |
+
+Optional configuration (defaults shown):
+```bash
+export KAFKA_SERVER="localhost:9092"
+export GDELT_KAFKA_TOPIC="news-topic"
+export ANOMALY_KAFKA_TOPIC="wikipedia-anomalies"
+export VERIFIED_KAFKA_TOPIC="verified-events"
+export SIMILARITY_THRESHOLD="0.7"
+export NEWS_RETENTION_HOURS="24"   # how far back to keep news embeddings for matching
+export EMBEDDING_MODEL="all-MiniLM-L6-v2"
+export QDRANT_URL="http://localhost:6333"
+```
+
+To check the output:
+```bash
+python -c "
+from kafka import KafkaConsumer
+c = KafkaConsumer('verified-events', bootstrap_servers='localhost:9092', auto_offset_reset='earliest', consumer_timeout_ms=8000)
+for msg in c:
+    print(msg.value.decode())
+"
 ```

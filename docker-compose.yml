@@ -26,5 +26,20 @@ services:
     volumes:
       - kafka-data:/var/lib/kafka/data
 
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: wikipulse-qdrant
+
+    ports:
+      - "6333:6333"
+
+    environment:
+      QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS: 1
+      QDRANT__STORAGE__PERFORMANCE__MAX_OPTIMIZATION_THREADS: 1
+
+    volumes:
+      - qdrant-data:/qdrant/storage
+
 volumes:
   kafka-data:
+  qdrant-data:
