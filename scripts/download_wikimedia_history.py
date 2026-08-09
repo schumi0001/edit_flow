@@ -1,78 +1,150 @@
 #!/usr/bin/env python3
-"""Download a Wikimedia recent-changes archive, normalize it, and train the model.
+"""Download real historical Wikipedia edits, normalize them, and train the model.
 
-This script is intentionally simple:
-- it downloads a gzipped JSONL archive from Wikimedia's recent changes feed;
-- it writes a normalized JSONL file compatible with the historical training loader;
-- it then trains the anomaly model from that file.
+Unlike the live EventStreams feed (which only shows edits as they happen),
+the MediaWiki `recentchanges` API lets us page backward through edits that
+already happened, bounded by a date range -- this is genuine historical
+data, not a tap on the live stream. The recentchanges table only retains
+roughly the last 30 days of edits, so this can't reach further back than
+that.
 """
 
 import argparse
-import gzip
 import json
-import os
+import subprocess
 import sys
+import time
+import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from models.historical_training import load_historical_features_from_jsonl
-from models.train_model import main as train_main
+API_URL_TEMPLATE = "https://{wiki}/w/api.php"
+USER_AGENT = "WikiPulse/1.0 (student big-data project; historical training fetch)"
 
 
-def download_archive(url: str, output_path: Path) -> Path:
-    print(f"Downloading {url} -> {output_path}")
-    urllib.request.urlretrieve(url, output_path)
-    return output_path
+def _parse_timestamp(value: str) -> int:
+    try:
+        return int(
+            datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+    except (TypeError, ValueError):
+        return 0
 
 
-def normalize_archive(input_path: Path, output_path: Path) -> Path:
-    print(f"Normalizing {input_path} -> {output_path}")
+def fetch_recent_changes(wiki: str, newest: datetime, oldest: datetime, limit: int) -> list[dict]:
+    """Page backward through real historical edits, from `newest` down to `oldest`."""
+    api_url = API_URL_TEMPLATE.format(wiki=wiki)
+    params = {
+        "action": "query",
+        "list": "recentchanges",
+        "rcprop": "title|user|timestamp|sizes|flags",
+        "rctype": "edit|new",
+        "rcnamespace": "0",
+        "rclimit": "500",
+        "rcdir": "older",
+        "rcstart": newest.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "rcend": oldest.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "format": "json",
+        "formatversion": "2",
+    }
+
+    records: list[dict] = []
+    rccontinue = None
+
+    while len(records) < limit:
+        query = dict(params)
+        if rccontinue:
+            query["rccontinue"] = rccontinue
+
+        url = f"{api_url}?{urllib.parse.urlencode(query)}"
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        changes = payload.get("query", {}).get("recentchanges", [])
+        if not changes:
+            break
+
+        records.extend(changes)
+        print(f"  fetched {len(records)} edits so far...")
+
+        rccontinue = payload.get("continue", {}).get("rccontinue")
+        if not rccontinue:
+            break
+
+        time.sleep(0.2)  # be polite to the API
+
+    return records[:limit]
+
+
+def normalize_and_write(changes: list[dict], output_path: Path) -> int:
+    """Write MediaWiki API edit records as JSONL matching the historical training schema."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with gzip.open(input_path, "rt", encoding="utf-8") as src:
-        with open(output_path, "w", encoding="utf-8") as dst:
-            for line in src:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+    count = 0
+    with open(output_path, "w", encoding="utf-8") as handle:
+        for change in changes:
+            page_title = change.get("title")
+            user = change.get("user")
+            if not page_title or not user:
+                continue
 
-                if not isinstance(payload, dict):
-                    continue
+            old_length = change.get("oldlen")
+            new_length = change.get("newlen")
+            byte_change = (
+                new_length - old_length
+                if old_length is not None and new_length is not None
+                else 0
+            )
 
-                normalized = {
-                    "page_title": payload.get("title") or payload.get("page_title") or payload.get("page"),
-                    "user": payload.get("user") or payload.get("user_name"),
-                    "bot": bool(payload.get("bot", False)),
-                    "minor": bool(payload.get("minor", False)),
-                    "timestamp": payload.get("timestamp") or payload.get("ts") or payload.get("time") or 0,
-                }
+            normalized = {
+                "page_title": page_title,
+                "user": user,
+                "bot": bool(change.get("bot", False)),
+                "minor": bool(change.get("minor", False)),
+                "timestamp": _parse_timestamp(change.get("timestamp")),
+                "byte_change": byte_change,
+            }
 
-                old_length = payload.get("old_length") or payload.get("oldlen")
-                new_length = payload.get("new_length") or payload.get("newlen")
-                if old_length is not None and new_length is not None:
-                    normalized["byte_change"] = int(new_length) - int(old_length)
-                else:
-                    normalized["byte_change"] = 0
+            handle.write(json.dumps(normalized, ensure_ascii=False) + "\n")
+            count += 1
 
-                dst.write(json.dumps(normalized) + "\n")
-
-    return output_path
+    return count
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Download and train from a Wikimedia recent-changes archive")
+    parser = argparse.ArgumentParser(
+        description="Download real historical Wikipedia edits and train the model"
+    )
     parser.add_argument(
-        "--url",
-        default="https://stream.wikimedia.org/v2/stream/recentchange",
-        help="Wikimedia recent changes stream URL. This script expects a gzipped JSONL archive if you use a file URL.",
+        "--wiki",
+        default="en.wikipedia.org",
+        help="Wiki domain to pull historical edits from",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help=(
+            "How many days of history to pull, counting back from now. "
+            "The recentchanges table only retains roughly the last 30 "
+            "days, so larger values will likely return nothing for the "
+            "oldest portion of the range."
+        ),
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=20000,
+        help="Maximum number of historical edits to fetch",
     )
     parser.add_argument(
         "--output-dir",
@@ -82,25 +154,38 @@ def main() -> None:
     parser.add_argument(
         "--model-path",
         default=None,
-        help="Optional output model path",
+        help="Optional output model path, forwarded to train_model.py",
     )
     args = parser.parse_args()
 
+    newest = datetime.now(timezone.utc)
+    oldest = newest - timedelta(days=args.days)
+
+    print(
+        f"Fetching up to {args.limit} historical edits from {args.wiki} "
+        f"between {oldest.isoformat()} and {newest.isoformat()}..."
+    )
+    changes = fetch_recent_changes(args.wiki, newest, oldest, args.limit)
+
+    if not changes:
+        print(
+            "No historical edits were returned. The recentchanges table "
+            "may not retain data that far back -- try a smaller --days "
+            "value."
+        )
+        sys.exit(1)
+
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    normalized_path = output_dir / f"{args.wiki}.recentchanges.jsonl"
+    written = normalize_and_write(changes, normalized_path)
+    print(f"Wrote {written} normalized historical edits to {normalized_path}")
 
-    archive_path = output_dir / "recentchanges.jsonl.gz"
-    normalized_path = output_dir / "recentchanges.normalized.jsonl"
-
-    if not archive_path.exists():
-        download_archive(args.url, archive_path)
-
-    normalize_archive(archive_path, normalized_path)
-    print(f"Normalized history written to {normalized_path}")
-
-    # Train directly from the normalized file.
-    import subprocess
-    command = [sys.executable, str(ROOT / "models" / "train_model.py"), "--history-jsonl", str(normalized_path)]
+    command = [
+        sys.executable,
+        str(ROOT / "models" / "train_model.py"),
+        "--history-jsonl",
+        str(normalized_path),
+    ]
     if args.model_path:
         command.extend(["--model-path", args.model_path])
     subprocess.run(command, check=True, cwd=str(ROOT))

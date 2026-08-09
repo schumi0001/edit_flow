@@ -9,7 +9,7 @@ from typing import Optional
 FEATURES_DIR = "data/lake/features"
 MODEL_DIR = "models"
 MODEL_PATH = os.path.join(MODEL_DIR, "anomaly_detector.joblib")
-
+112
 
 def _read_jsonl_records(path: str) -> list[dict]:
     """Read a JSONL or gzipped JSONL file into a list of dictionaries."""

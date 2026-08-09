@@ -5,6 +5,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from pipeline_manager import (
+    get_last_failure,
     get_pipeline_status,
     read_log,
     start_pipeline,
@@ -37,11 +38,21 @@ with st.sidebar:
     st.header("Pipeline Control")
 
     status = get_pipeline_status()
+    process_names = {"Spark": "spark", "Producer": "producer"}
 
     for component, running in status.items():
         icon = "🟢" if running else "🔴"
         state = "Running" if running else "Stopped"
         st.write(f"{icon} **{component}:** {state}")
+
+        if running or component not in process_names:
+            continue
+
+        failure = get_last_failure(process_names[component])
+
+        if failure:
+            with st.expander(f"Why did {component} stop?"):
+                st.code(failure["log_tail"], language="text")
 
     start_column, stop_column = st.columns(2)
 
@@ -149,12 +160,24 @@ def get_data_signature():
     )
 
 
-@st.cache_data(show_spinner="Loading Wikipedia edits...")
+@st.cache_data(show_spinner="Loading Wikipedia edits...", max_entries=1)
 def load_data(data_signature):
     if not data_signature:
         return pd.DataFrame()
 
-    df = pd.read_parquet(DATA_DIRECTORY)
+    # Stopping/killing the Spark writer mid-batch can leave a 0-byte
+    # part file behind; pyarrow refuses to open those, which would
+    # otherwise crash the whole dashboard on the next refresh.
+    parquet_files = [
+        str(DATA_DIRECTORY / name)
+        for name, size, _ in data_signature
+        if size > 0
+    ]
+
+    if not parquet_files:
+        return pd.DataFrame()
+
+    df = pd.read_parquet(parquet_files)
 
     # Convert Wikimedia's Unix timtamp into a readable datetime.
     if "timestamp" in df.columns:
@@ -367,6 +390,85 @@ else:
     st.info("No live anomaly alerts have been emitted yet. Start the scorer and feed the live Wikimedia stream to populate this section.")
 
 # ---------------------------------------------------------
+# Anomalies verified against real news (vector search)
+# ---------------------------------------------------------
+
+st.subheader("Anomalies verified against real news")
+
+verified_messages = []
+try:
+    from kafka import KafkaConsumer
+
+    consumer = KafkaConsumer(
+        "verified-events",
+        bootstrap_servers="localhost:9092",
+        auto_offset_reset="earliest",
+        consumer_timeout_ms=4000,
+    )
+    verified_messages = [
+        parse_anomaly_message(message.value)
+        for message in consumer
+        if parse_anomaly_message(message.value) is not None
+    ]
+    consumer.close()
+except Exception:
+    verified_messages = []
+
+if verified_messages:
+    verified_df = pd.DataFrame(verified_messages)
+    verified_df["news_title"] = verified_df["matched_article"].apply(
+        lambda article: (article or {}).get("title")
+    )
+    verified_df["news_url"] = verified_df["matched_article"].apply(
+        lambda article: (article or {}).get("url")
+    )
+    verified_df = verified_df.sort_values(
+        by=["matched", "similarity_score"],
+        ascending=[False, False],
+    )
+
+    st.dataframe(
+        verified_df[
+            [
+                "page_title",
+                "matched",
+                "similarity_score",
+                "news_title",
+                "news_url",
+                "anomaly_score",
+                "edit_count",
+            ]
+        ].rename(
+            columns={
+                "page_title": "Wikipedia page",
+                "matched": "Confirmed real event?",
+                "similarity_score": "Similarity",
+                "news_title": "Matched news article",
+                "news_url": "URL",
+                "anomaly_score": "Anomaly score",
+                "edit_count": "Edit count",
+            }
+        ),
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "URL": st.column_config.LinkColumn("URL", display_text="Open article"),
+            "Similarity": st.column_config.NumberColumn("Similarity", format="%.2f"),
+        },
+    )
+
+    matched_count = int(verified_df["matched"].sum())
+    st.caption(
+        f"{matched_count} of {len(verified_df)} evaluated anomalies matched a "
+        "recent news article (cosine similarity ≥ 0.7)."
+    )
+else:
+    st.info(
+        "No anomalies have been evaluated against news yet. Start "
+        "`vectordb/match_events.py` to populate this section."
+    )
+
+# ---------------------------------------------------------
 # Largest changes
 # ---------------------------------------------------------
 
@@ -489,7 +591,6 @@ with st.expander("Dataset information"):
 
 
 st.caption(
-    "This dashboard currently displays the raw-data layer. "
-    "Trend detection, anomaly scoring, and news correlation will "
-    "be added in the intelligence phase."
+    "This dashboard displays the raw-data layer plus anomaly scoring "
+    "and news-correlation results from the intelligence phase."
 )

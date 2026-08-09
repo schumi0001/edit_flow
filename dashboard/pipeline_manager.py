@@ -1,6 +1,5 @@
 import json
 import os
-import shutil
 import signal
 import socket
 import subprocess
@@ -21,11 +20,6 @@ LOG_DIRECTORY.mkdir(exist_ok=True)
 KAFKA_HOST = "localhost"
 KAFKA_PORT = 9092
 
-SPARK_PACKAGE = (
-    "org.apache.spark:"
-    "spark-sql-kafka-0-10_2.13:4.2.0"
-)
-
 
 def _pid_file(process_name):
     return RUNTIME_DIRECTORY / f"{process_name}.json"
@@ -33,6 +27,10 @@ def _pid_file(process_name):
 
 def _log_file(process_name):
     return LOG_DIRECTORY / f"{process_name}.log"
+
+
+def _exit_file(process_name):
+    return RUNTIME_DIRECTORY / f"{process_name}_last_exit.json"
 
 
 def _read_process_info(process_name):
@@ -82,6 +80,53 @@ def is_process_running(process_name):
         return False
 
 
+def _record_unexpected_exit(process_name, pid):
+    exit_path = _exit_file(process_name)
+
+    try:
+        existing = json.loads(exit_path.read_text())
+    except (json.JSONDecodeError, OSError, FileNotFoundError):
+        existing = None
+
+    # Already recorded this same death; avoid re-reading a
+    # multi-megabyte log file on every status poll.
+    if existing and existing.get("pid") == pid:
+        return
+
+    log_path = _log_file(process_name)
+    log_tail = ""
+
+    if log_path.exists():
+        try:
+            lines = log_path.read_text(errors="replace").splitlines()
+            log_tail = "\n".join(lines[-40:])
+        except OSError:
+            log_tail = ""
+
+    exit_path.write_text(
+        json.dumps(
+            {
+                "pid": pid,
+                "detected_at": time.time(),
+                "log_tail": log_tail,
+            },
+            indent=2,
+        )
+    )
+
+
+def get_last_failure(process_name):
+    exit_path = _exit_file(process_name)
+
+    if not exit_path.exists():
+        return None
+
+    try:
+        return json.loads(exit_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 def _start_process(process_name, command):
     if is_process_running(process_name):
         return False
@@ -125,6 +170,10 @@ def _start_process(process_name, command):
         json.dumps(process_info, indent=2)
     )
 
+    # A fresh start means any previously recorded death is no
+    # longer the current story for this process.
+    _exit_file(process_name).unlink(missing_ok=True)
+
     return True
 
 
@@ -135,26 +184,29 @@ def _stop_process(process_name, timeout=10):
         return False
 
     pid = info.get("pid")
+    still_ours = is_process_running(process_name)
 
-    try:
-        process = psutil.Process(pid)
+    # Remove the pid file before signaling the process, not after.
+    # Otherwise a status poll landing in the SIGTERM/wait window below
+    # would see "pid file present but process not running" and record
+    # this intentional stop as an unexpected exit.
+    _pid_file(process_name).unlink(missing_ok=True)
 
-        if is_process_running(process_name):
+    if still_ours:
+        try:
             os.killpg(os.getpgid(pid), signal.SIGTERM)
 
             try:
-                process.wait(timeout=timeout)
+                psutil.Process(pid).wait(timeout=timeout)
             except psutil.TimeoutExpired:
                 os.killpg(os.getpgid(pid), signal.SIGKILL)
 
-    except (
-        psutil.NoSuchProcess,
-        ProcessLookupError,
-        PermissionError,
-    ):
-        pass
-    finally:
-        _pid_file(process_name).unlink(missing_ok=True)
+        except (
+            psutil.NoSuchProcess,
+            ProcessLookupError,
+            PermissionError,
+        ):
+            pass
 
     return True
 
@@ -203,33 +255,25 @@ def _wait_for_kafka(timeout=60):
     return False
 
 
-def _find_spark_submit():
-    venv_spark = (
-        PROJECT_ROOT
-        / ".venv"
-        / "bin"
-        / "spark-submit"
-    )
+def _check_for_unexpected_exit(process_name):
+    if is_process_running(process_name):
+        return True
 
-    if venv_spark.exists():
-        return str(venv_spark)
+    # A pid file surviving past a dead process means nobody called
+    # _stop_process for it -- it died on its own. Capture why.
+    info = _read_process_info(process_name)
 
-    spark_submit = shutil.which("spark-submit")
+    if info:
+        _record_unexpected_exit(process_name, info.get("pid"))
 
-    if spark_submit:
-        return spark_submit
-
-    raise RuntimeError(
-        "spark-submit was not found. Activate the virtual "
-        "environment and install PySpark."
-    )
+    return False
 
 
 def get_pipeline_status():
     return {
         "Kafka": is_kafka_running(),
-        "Spark": is_process_running("spark"),
-        "Producer": is_process_running("producer"),
+        "Spark": _check_for_unexpected_exit("spark"),
+        "Producer": _check_for_unexpected_exit("producer"),
     }
 
 
@@ -261,12 +305,17 @@ def start_pipeline():
             "Kafka started, but port 9092 did not become ready."
         )
 
+    # Launched via plain `python`, not spark-submit: wiki_stream.py sets
+    # spark.driver.memory / spark.master itself via SparkSession.builder,
+    # and those only take effect if the driver JVM doesn't already exist
+    # when that code runs. spark-submit starts the JVM (with Spark's
+    # default 1g heap) before the script executes, silently overriding
+    # the script's own memory tuning -- which matters on this
+    # memory-constrained devcontainer.
     spark_started = _start_process(
         "spark",
         [
-            _find_spark_submit(),
-            "--packages",
-            SPARK_PACKAGE,
+            sys.executable,
             PROJECT_ROOT / "spark" / "wiki_stream.py",
         ],
     )

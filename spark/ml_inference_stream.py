@@ -26,9 +26,9 @@ trained_model = load_model(MODEL_PATH)
 spark = (
     SparkSession.builder
     .appName("WikiPulseMLInferenceStream")
-    .master("local[2]")
+    .master("local[1]")
     .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0")
-    .config("spark.driver.memory", "1g")
+    .config("spark.driver.memory", "512m")
     .config("spark.sql.shuffle.partitions", "4")
     .config("spark.ui.enabled", "false")
     .getOrCreate()

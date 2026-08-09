@@ -10,9 +10,9 @@ KAFKA_PACKAGE = "org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0"
 spark = (
     SparkSession.builder
     .appName("WikiPulseMLFeatureStream")
-    .master("local[2]")
+    .master("local[1]")
     .config("spark.jars.packages", KAFKA_PACKAGE)
-    .config("spark.driver.memory", "1g")
+    .config("spark.driver.memory", "512m")
     .config("spark.sql.shuffle.partitions", "4")
     .config("spark.ui.enabled", "false")
     .getOrCreate()
