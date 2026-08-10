@@ -19,6 +19,37 @@ LOG_DIRECTORY.mkdir(exist_ok=True)
 
 KAFKA_HOST = "localhost"
 KAFKA_PORT = 9092
+QDRANT_PORT = 6333
+
+DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "anomaly_detector.joblib"
+
+# Every Python process the dashboard manages. The "spark" and "producer"
+# names are kept from the original pipeline so pid files written by earlier
+# dashboard versions keep being recognized (no duplicate processes after an
+# upgrade). Order matters: it is the start order (upstream Spark consumers
+# first, then producers, then downstream matchers).
+PYTHON_PROCESSES = {
+    "spark": {
+        "label": "Raw edit archiver (Spark)",
+        "script": PROJECT_ROOT / "spark" / "wiki_stream.py",
+    },
+    "inference": {
+        "label": "Anomaly scorer (Spark)",
+        "script": PROJECT_ROOT / "spark" / "ml_inference_stream.py",
+    },
+    "producer": {
+        "label": "Wikipedia producer",
+        "script": PROJECT_ROOT / "producer" / "wikipedia_producer.py",
+    },
+    "gdelt": {
+        "label": "GDELT news producer",
+        "script": PROJECT_ROOT / "producer" / "gdelt_producer.py",
+    },
+    "matcher": {
+        "label": "News matcher (Qdrant)",
+        "script": PROJECT_ROOT / "vectordb" / "match_events.py",
+    },
+}
 
 
 def _pid_file(process_name):
@@ -211,7 +242,7 @@ def _stop_process(process_name, timeout=10):
     return True
 
 
-def is_kafka_running():
+def _running_compose_services():
     try:
         result = subprocess.run(
             [
@@ -229,23 +260,30 @@ def is_kafka_running():
             check=False,
         )
 
-        running_services = result.stdout.splitlines()
-        return "kafka" in running_services
+        return set(result.stdout.split())
 
     except (
         FileNotFoundError,
         subprocess.TimeoutExpired,
     ):
-        return False
+        return set()
 
 
-def _wait_for_kafka(timeout=60):
+def is_kafka_running():
+    return "kafka" in _running_compose_services()
+
+
+def is_qdrant_running():
+    return "qdrant" in _running_compose_services()
+
+
+def _wait_for_port(port, timeout=60):
     deadline = time.time() + timeout
 
     while time.time() < deadline:
         try:
             with socket.create_connection(
-                (KAFKA_HOST, KAFKA_PORT),
+                (KAFKA_HOST, port),
                 timeout=2,
             ):
                 return True
@@ -253,6 +291,48 @@ def _wait_for_kafka(timeout=60):
             time.sleep(1)
 
     return False
+
+
+def model_path():
+    override = os.environ.get("ANOMALY_MODEL_PATH")
+    return Path(override) if override else DEFAULT_MODEL_PATH
+
+
+def is_model_trained():
+    return model_path().exists()
+
+
+def train_model(timeout=900):
+    """Train the anomaly model once, synchronously, via models/train_model.py.
+
+    This is only meant to be triggered explicitly from the UI when the model
+    file is missing -- never automatically on pipeline start.
+    """
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(PROJECT_ROOT / "models" / "train_model.py"),
+        ],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+    output = "\n".join(
+        part.strip()
+        for part in (result.stdout, result.stderr)
+        if part and part.strip()
+    )
+
+    if result.returncode != 0 or not is_model_trained():
+        tail = "\n".join(output.splitlines()[-15:])
+        raise RuntimeError(
+            f"Model training failed (exit code {result.returncode}):\n{tail}"
+        )
+
+    return output
 
 
 def _check_for_unexpected_exit(process_name):
@@ -270,109 +350,187 @@ def _check_for_unexpected_exit(process_name):
 
 
 def get_pipeline_status():
-    return {
-        "Kafka": is_kafka_running(),
-        "Spark": _check_for_unexpected_exit("spark"),
-        "Producer": _check_for_unexpected_exit("producer"),
+    """Describe every managed component.
+
+    Returns an ordered mapping of display label -> entry, where an entry is:
+      kind    "service" (Docker), "process" (managed Python), or "artifact"
+      state   "running" / "stopped" / "blocked" / "ready" / "missing"
+      process pid-file name (only for kind == "process")
+      detail  optional short human explanation
+    """
+    services = _running_compose_services()
+    model_ready = is_model_trained()
+
+    status = {
+        "Kafka": {
+            "kind": "service",
+            "state": "running" if "kafka" in services else "stopped",
+        },
+        "Qdrant": {
+            "kind": "service",
+            "state": "running" if "qdrant" in services else "stopped",
+        },
     }
+
+    for name, spec in PYTHON_PROCESSES.items():
+        running = _check_for_unexpected_exit(name)
+        entry = {
+            "kind": "process",
+            "process": name,
+            "state": "running" if running else "stopped",
+        }
+
+        if name == "inference" and not running and not model_ready:
+            entry["state"] = "blocked"
+            entry["detail"] = "Needs the trained anomaly model"
+
+        if name == "matcher" and not running and "qdrant" not in services:
+            entry["detail"] = "Needs the Qdrant container"
+
+        status[spec["label"]] = entry
+
+    status["Anomaly model"] = {
+        "kind": "artifact",
+        "state": "ready" if model_ready else "missing",
+        "detail": (
+            None
+            if model_ready
+            else "Use the Train model button below"
+        ),
+    }
+
+    return status
+
+
+def _try_start(name, messages, errors):
+    """Start one managed process, reporting instead of raising."""
+    label = PYTHON_PROCESSES[name]["label"]
+    script = PYTHON_PROCESSES[name]["script"]
+
+    try:
+        started = _start_process(
+            name,
+            [sys.executable, script],
+        )
+    except RuntimeError as error:
+        errors.append(f"{label}: {error}")
+        return False
+
+    messages.append(
+        f"{label} started"
+        if started
+        else f"{label} was already running"
+    )
+    return started
 
 
 def start_pipeline():
-    messages = []
+    """Start the full system. Never restarts components already running.
 
-    if not is_kafka_running():
+    Returns {"messages": [...], "errors": [...]}. Only a Kafka startup
+    failure raises, since nothing downstream can work without it;
+    every other component failure is reported in "errors" so the rest
+    of the pipeline still comes up.
+    """
+    messages = []
+    errors = []
+
+    services = _running_compose_services()
+
+    if {"kafka", "qdrant"} - services:
         result = subprocess.run(
-            ["docker", "compose", "up", "-d", "kafka"],
+            ["docker", "compose", "up", "-d", "kafka", "qdrant"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
-            timeout=90,
+            timeout=120,
             check=False,
         )
 
         if result.returncode != 0:
             raise RuntimeError(
                 result.stderr.strip()
-                or "Kafka could not be started."
+                or "Kafka/Qdrant containers could not be started."
             )
 
-        messages.append("Kafka started")
+        messages.append("Kafka and Qdrant containers started")
     else:
-        messages.append("Kafka was already running")
+        messages.append("Kafka and Qdrant were already running")
 
-    if not _wait_for_kafka():
+    if not _wait_for_port(KAFKA_PORT):
         raise RuntimeError(
             "Kafka started, but port 9092 did not become ready."
         )
 
-    # Launched via plain `python`, not spark-submit: wiki_stream.py sets
-    # spark.driver.memory / spark.master itself via SparkSession.builder,
+    if not _wait_for_port(QDRANT_PORT, timeout=30):
+        errors.append(
+            "Qdrant port 6333 did not become ready; "
+            "news matching may not work."
+        )
+
+    # Launched via plain `python`, not spark-submit: the Spark scripts set
+    # spark.driver.memory / spark.master themselves via SparkSession.builder,
     # and those only take effect if the driver JVM doesn't already exist
     # when that code runs. spark-submit starts the JVM (with Spark's
     # default 1g heap) before the script executes, silently overriding
     # the script's own memory tuning -- which matters on this
-    # memory-constrained devcontainer.
-    spark_started = _start_process(
-        "spark",
-        [
-            sys.executable,
-            PROJECT_ROOT / "spark" / "wiki_stream.py",
-        ],
-    )
+    # memory-constrained setup.
+    spark_started = _try_start("spark", messages, errors)
 
-    messages.append(
-        "Spark started"
-        if spark_started
-        else "Spark was already running"
-    )
-
-    # Give Spark time to initialize its streaming query before
-    # the producer begins publishing new events.
-    if spark_started:
-        time.sleep(8)
-
-    producer_started = _start_process(
-        "producer",
-        [
-            sys.executable,
-            PROJECT_ROOT
-            / "producer"
-            / "wikipedia_producer.py",
-        ],
-    )
-
-    messages.append(
-        "Producer started"
-        if producer_started
-        else "Producer was already running"
-    )
-
-    return messages
-
-
-def stop_pipeline(stop_kafka=True):
-    messages = []
-
-    if _stop_process("producer"):
-        messages.append("Producer stopped")
-
-    if _stop_process("spark"):
-        messages.append("Spark stopped")
-
-    if stop_kafka and is_kafka_running():
-        result = subprocess.run(
-            ["docker", "compose", "stop", "kafka"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
+    if is_model_trained():
+        inference_started = _try_start("inference", messages, errors)
+    else:
+        inference_started = False
+        messages.append(
+            "Anomaly scorer skipped (train the anomaly model first)"
         )
 
-        if result.returncode == 0:
-            messages.append("Kafka stopped")
-        else:
-            messages.append("Kafka could not be stopped")
+    # Give the Spark streaming queries time to initialize before the
+    # producer begins publishing new events.
+    if spark_started or inference_started:
+        time.sleep(8)
+
+    _try_start("producer", messages, errors)
+    _try_start("gdelt", messages, errors)
+    _try_start("matcher", messages, errors)
+
+    return {"messages": messages, "errors": errors}
+
+
+def stop_pipeline(stop_docker=True):
+    """Stop every managed Python process, then the Docker containers.
+
+    Only stops containers (docker compose stop) -- never removes volumes,
+    so Kafka topics and the Qdrant index survive. Checkpoints, Parquet
+    output, and the trained model on disk are not touched at all.
+    """
+    messages = []
+
+    # Producers first so no new events arrive while consumers drain,
+    # then the downstream consumers.
+    for name in ("producer", "gdelt", "matcher", "inference", "spark"):
+        if _stop_process(name):
+            messages.append(f"{PYTHON_PROCESSES[name]['label']} stopped")
+
+    if stop_docker:
+        running = _running_compose_services() & {"kafka", "qdrant"}
+
+        if running:
+            result = subprocess.run(
+                ["docker", "compose", "stop", *sorted(running)],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+
+            if result.returncode == 0:
+                messages.append(
+                    " and ".join(sorted(running)).capitalize() + " stopped"
+                )
+            else:
+                messages.append("Docker containers could not be stopped")
 
     return messages or ["Pipeline was already stopped"]
 

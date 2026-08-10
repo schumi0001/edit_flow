@@ -1,19 +1,23 @@
 import os
+from collections import deque
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from pipeline_manager import (
+    PYTHON_PROCESSES,
     get_last_failure,
     get_pipeline_status,
+    is_model_trained,
     read_log,
     start_pipeline,
     stop_pipeline,
+    train_model,
 )
-from anomaly_utils import parse_anomaly_message
+from anomaly_utils import flatten_verified_event, parse_anomaly_message
 
 # Anomaly/verified-event windows are 15 minutes wide and slide every 5
 # minutes, so a single page shows up as several near-duplicate messages
@@ -58,6 +62,66 @@ st.set_page_config(
     layout="wide",
 )
 
+KAFKA_SERVER = "localhost:9092"
+
+STATE_BADGES = {
+    "running": ("🟢", "Running"),
+    "ready": ("🟢", "Ready"),
+    "stopped": ("🔴", "Stopped"),
+    "missing": ("🔴", "Missing"),
+    "blocked": ("🟡", "Blocked"),
+}
+
+
+# ---------------------------------------------------------
+# Kafka topic reading (shared by all intelligence sections)
+# ---------------------------------------------------------
+
+@st.cache_data(ttl=8, show_spinner=False)
+def read_topic_messages(topic, limit=400, timeout_ms=3000):
+    """Read up to the last `limit` JSON messages from a Kafka topic.
+
+    Returns [] when Kafka is unreachable or the topic is empty. A bounded
+    deque keeps memory flat even if the topic grows large.
+    """
+    messages = deque(maxlen=limit)
+
+    try:
+        from kafka import KafkaConsumer
+
+        consumer = KafkaConsumer(
+            topic,
+            bootstrap_servers=KAFKA_SERVER,
+            auto_offset_reset="earliest",
+            consumer_timeout_ms=timeout_ms,
+        )
+
+        for message in consumer:
+            parsed = parse_anomaly_message(message.value)
+            if parsed is not None:
+                messages.append(parsed)
+
+        consumer.close()
+    except Exception:
+        return []
+
+    return list(messages)
+
+
+def format_window(start, end):
+    """Render a page/window pair like 'Aug 10 14:30 – 14:45' compactly."""
+    try:
+        start_time = pd.to_datetime(start)
+        end_time = pd.to_datetime(end)
+        if pd.isna(start_time) or pd.isna(end_time):
+            raise ValueError
+        return f"{start_time:%b %d %H:%M} – {end_time:%H:%M}"
+    except (ValueError, TypeError):
+        if start or end:
+            return f"{start or '?'} – {end or '?'}"
+        return None
+
+
 # ---------------------------------------------------------
 # Pipeline control panel
 # ---------------------------------------------------------
@@ -69,25 +133,48 @@ if "pipeline_error" not in st.session_state:
     st.session_state.pipeline_error = None
 
 
+status = get_pipeline_status()
+
 with st.sidebar:
-    st.header("Pipeline Control")
+    st.header("Pipeline health")
 
-    status = get_pipeline_status()
-    process_names = {"Spark": "spark", "Producer": "producer"}
+    for component, entry in status.items():
+        icon, state_label = STATE_BADGES.get(entry["state"], ("⚪", "Unknown"))
+        st.write(f"{icon} **{component}:** {state_label}")
 
-    for component, running in status.items():
-        icon = "🟢" if running else "🔴"
-        state = "Running" if running else "Stopped"
-        st.write(f"{icon} **{component}:** {state}")
+        if entry.get("detail"):
+            st.caption(entry["detail"])
 
-        if running or component not in process_names:
-            continue
+        # Crash log for managed processes that died on their own.
+        if entry["kind"] == "process" and entry["state"] != "running":
+            failure = get_last_failure(entry["process"])
 
-        failure = get_last_failure(process_names[component])
+            if failure:
+                with st.expander(f"Why did {component} stop?"):
+                    st.code(failure["log_tail"], language="text")
 
-        if failure:
-            with st.expander(f"Why did {component} stop?"):
-                st.code(failure["log_tail"], language="text")
+    if not is_model_trained():
+        st.warning(
+            "The anomaly model has not been trained yet. Anomaly "
+            "detection (and therefore news matching results) stays "
+            "disabled until you train it. Training uses the committed "
+            "historical dataset and takes well under a minute."
+        )
+
+        if st.button("Train model", use_container_width=True):
+            with st.spinner("Training anomaly model..."):
+                try:
+                    output = train_model()
+                    last_line = output.splitlines()[-1] if output else ""
+                    st.session_state.pipeline_message = (
+                        f"Model trained. {last_line}"
+                    )
+                    st.session_state.pipeline_error = None
+                except Exception as error:
+                    st.session_state.pipeline_error = str(error)
+                    st.session_state.pipeline_message = None
+
+            st.rerun()
 
     start_column, stop_column = st.columns(2)
 
@@ -98,11 +185,13 @@ with st.sidebar:
             use_container_width=True,
         ):
             try:
-                messages = start_pipeline()
+                result = start_pipeline()
                 st.session_state.pipeline_message = (
-                    " · ".join(messages)
+                    " · ".join(result["messages"])
                 )
-                st.session_state.pipeline_error = None
+                st.session_state.pipeline_error = (
+                    "\n\n".join(result["errors"]) or None
+                )
             except Exception as error:
                 st.session_state.pipeline_error = str(error)
                 st.session_state.pipeline_message = None
@@ -115,7 +204,7 @@ with st.sidebar:
             use_container_width=True,
         ):
             try:
-                messages = stop_pipeline(stop_kafka=True)
+                messages = stop_pipeline(stop_docker=True)
                 st.session_state.pipeline_message = (
                     " · ".join(messages)
                 )
@@ -160,11 +249,9 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-    with st.expander("Spark log"):
-        st.code(read_log("spark"), language="text")
-
-    with st.expander("Producer log"):
-        st.code(read_log("producer"), language="text")
+    for process_name, spec in PYTHON_PROCESSES.items():
+        with st.expander(f"{spec['label']} log"):
+            st.code(read_log(process_name), language="text")
 
 # dashboard/app.py -> project root -> data/raw_wikipedia_edits
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -252,21 +339,10 @@ def load_data(data_signature):
 st.title("🌐 WikiPulse")
 
 st.caption(
-    "Live English Wikipedia edit activity collected through "
-    "Wikimedia → Kafka → Spark → Parquet"
+    "Live English Wikipedia edit activity with anomaly detection and "
+    "GDELT news correlation: Wikimedia + GDELT → Kafka → Spark / "
+    "scikit-learn / Qdrant → this dashboard"
 )
-
-if "refresh_message" not in st.session_state:
-    st.session_state.refresh_message = False
-
-# if st.button("Refresh data", type="primary"):
-#     st.cache_data.clear()
-#     st.session_state.refresh_message = True
-#     st.rerun()
-
-if st.session_state.refresh_message:
-    st.success("Data refreshed successfully.")
-    st.session_state.refresh_message = False
 
 
 data_signature = get_data_signature()
@@ -276,142 +352,115 @@ try:
 except Exception as error:
     st.error("The dashboard could not read the Parquet dataset.")
     st.exception(error)
-    st.stop()
+    df = pd.DataFrame()
 
 
 if df.empty:
     st.warning(
-        "No Wikipedia edit data is available yet. Start the producer "
-        "and Spark stream, then refresh this page."
-    )
-    st.code(
-        "python producer/wikipedia_producer.py\n\n"
-        "spark-submit \\\n"
-        "  --packages "
-        "org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0 \\\n"
-        "  spark/wiki_stream.py"
-    )
-    st.stop()
-
-
-# ---------------------------------------------------
-# Summary metrics
-# ---------------------------------------------------------
-
-total_edits = len(df)
-bot_edits = int(df["bot"].sum())
-human_edits = total_edits - bot_edits
-minor_edits = int(df["minor"].sum())
-total_byte_change = int(df["byte_change"].sum())
-
-metric_1, metric_2, metric_3, metric_4, metric_5 = st.columns(5)
-
-metric_1.metric("Total edits", f"{total_edits:,}")
-metric_2.metric("Human edits", f"{human_edits:,}")
-metric_3.metric("Bot edits", f"{bot_edits:,}")
-metric_4.metric("Minor edits", f"{minor_edits:,}")
-metric_5.metric(
-    "Net byte change",
-    f"{total_byte_change:+,}",
-)
-
-
-# ---------------------------------------------------------
-# Edit activity over time
-# ---------------------------------------------------------
-
-st.subheader("Edit activity over time")
-
-valid_times = df.dropna(subset=["event_time"]).copy()
-
-if not valid_times.empty:
-    edits_over_time = (
-        valid_times
-        .set_index("event_time")
-        .resample("1min")
-        .size()
-        .rename("edits")
-    )
-
-    st.line_chart(
-        edits_over_time,
-        y="edits",
-        x_label="Time",
-        y_label="Number of edits",
-    )
-else:
-    st.info("No valid event timestamps are currently available.")
-
-
-# ---------------------------------------------------------
-# Top pages and users
-# ---------------------------------------------------------
-
-left_column, right_column = st.columns(2)
-
-with left_column:
-    st.subheader("Most-edited pages")
-
-    top_pages = (
-        df["page_title"]
-        .dropna()
-        .value_counts()
-        .head(10)
-        .rename_axis("Page")
-        .rename("Edits")
-    )
-
-    st.bar_chart(
-        top_pages,
-        horizontal=True,
-        x_label="Number of edits",
-        y_label="Page",
-    )
-
-with right_column:
-    st.subheader("Most-active users")
-
-    top_users = (
-        df["user"]
-        .dropna()
-        .value_counts()
-        .head(10)
-        .rename_axis("User")
-        .rename("Edits")
-    )
-
-    st.bar_chart(
-        top_users,
-        horizontal=True,
-        x_label="Number of edits",
-        y_label="User",
+        "No Wikipedia edit data is available yet. Click Start Pipeline "
+        "in the sidebar, then give Spark a few seconds to write its "
+        "first Parquet batch."
     )
 
 
 # ---------------------------------------------------------
-# Anomaly alerts
+# Summary metrics and edit charts (need Parquet data)
+# ---------------------------------------------------------
+
+if not df.empty:
+    total_edits = len(df)
+    bot_edits = int(df["bot"].sum())
+    human_edits = total_edits - bot_edits
+    minor_edits = int(df["minor"].sum())
+    total_byte_change = int(df["byte_change"].sum())
+
+    metric_1, metric_2, metric_3, metric_4, metric_5 = st.columns(5)
+
+    metric_1.metric("Total edits", f"{total_edits:,}")
+    metric_2.metric("Human edits", f"{human_edits:,}")
+    metric_3.metric("Bot edits", f"{bot_edits:,}")
+    metric_4.metric("Minor edits", f"{minor_edits:,}")
+    metric_5.metric(
+        "Net byte change",
+        f"{total_byte_change:+,}",
+    )
+
+    st.subheader("Edit activity over time")
+
+    valid_times = df.dropna(subset=["event_time"]).copy()
+
+    if not valid_times.empty:
+        edits_over_time = (
+            valid_times
+            .set_index("event_time")
+            .resample("1min")
+            .size()
+            .rename("edits")
+        )
+
+        st.line_chart(
+            edits_over_time,
+            y="edits",
+            x_label="Time",
+            y_label="Number of edits",
+        )
+    else:
+        st.info("No valid event timestamps are currently available.")
+
+    left_column, right_column = st.columns(2)
+
+    with left_column:
+        st.subheader("Most-edited pages")
+
+        top_pages = (
+            df["page_title"]
+            .dropna()
+            .value_counts()
+            .head(10)
+            .rename_axis("Page")
+            .rename("Edits")
+        )
+
+        st.bar_chart(
+            top_pages,
+            horizontal=True,
+            x_label="Number of edits",
+            y_label="Page",
+        )
+
+    with right_column:
+        st.subheader("Most-active users")
+
+        top_users = (
+            df["user"]
+            .dropna()
+            .value_counts()
+            .head(10)
+            .rename_axis("User")
+            .rename("Edits")
+        )
+
+        st.bar_chart(
+            top_users,
+            horizontal=True,
+            x_label="Number of edits",
+            y_label="User",
+        )
+
+
+# ---------------------------------------------------------
+# Anomaly alerts (wikipedia-anomalies topic)
 # ---------------------------------------------------------
 
 st.subheader("Anomaly alerts")
 
-anomaly_messages = []
-try:
-    from kafka import KafkaConsumer
+scorer_status = status.get("Anomaly scorer (Spark)", {})
 
-    consumer = KafkaConsumer(
-        "wikipedia-anomalies",
-        bootstrap_servers="localhost:9092",
-        auto_offset_reset="earliest",
-        consumer_timeout_ms=4000,
-    )
-    anomaly_messages = [
-        parse_anomaly_message(message.value)
-        for message in consumer
-        if parse_anomaly_message(message.value) is not None
-    ]
-    consumer.close()
-except Exception:
-    anomaly_messages = []
+anomaly_messages = [
+    message
+    for message in read_topic_messages("wikipedia-anomalies")
+    if "page_title" in message and "anomaly_score" in message
+]
 
 if anomaly_messages:
     anomaly_df = pd.DataFrame(anomaly_messages)
@@ -452,8 +501,13 @@ if not recent_anomaly_df.empty:
             ]
         ].rename(
             columns={
+                "page_title": "Page",
                 "wikipedia_url": "Wikipedia page",
                 "detected_at": "Detected at",
+                "anomaly_score": "Anomaly score",
+                "edit_count": "Edits",
+                "unique_editors": "Editors",
+                "total_byte_changes": "Bytes changed",
                 "recent_comments": "Recent edit summaries",
             }
         ),
@@ -465,6 +519,9 @@ if not recent_anomaly_df.empty:
             ),
             "Recent edit summaries": st.column_config.TextColumn(
                 "Recent edit summaries", width="large"
+            ),
+            "Anomaly score": st.column_config.NumberColumn(
+                "Anomaly score", format="%.3f"
             ),
         },
     )
@@ -479,246 +536,389 @@ elif not anomaly_df.empty:
         f"{len(anomaly_df)} older anomaly message(s) exist in the topic "
         "but have aged out of this view."
     )
+elif scorer_status.get("state") == "blocked":
+    st.warning(
+        "Anomaly detection is disabled because the model has not been "
+        "trained. Use the Train model button in the sidebar, then "
+        "Start Pipeline."
+    )
+elif scorer_status.get("state") == "running":
+    st.info(
+        "The anomaly scorer is running and waiting for data. It scores "
+        "15-minute windows, so the first alerts can take a while — and "
+        "only windows that actually look anomalous are published."
+    )
 else:
-    st.info("No live anomaly alerts have been emitted yet. Start the scorer and feed the live Wikimedia stream to populate this section.")
+    st.info(
+        "The anomaly scorer is not running. Click Start Pipeline in "
+        "the sidebar to launch it."
+    )
 
 # ---------------------------------------------------------
-# Anomalies verified against real news (vector search)
+# Anomalies verified against real news (verified-events topic)
 # ---------------------------------------------------------
 
 st.subheader("Anomalies verified against real news")
 
-verified_messages = []
-try:
-    from kafka import KafkaConsumer
+matcher_status = status.get("News matcher (Qdrant)", {})
 
-    consumer = KafkaConsumer(
-        "verified-events",
-        bootstrap_servers="localhost:9092",
-        auto_offset_reset="earliest",
-        consumer_timeout_ms=4000,
-    )
-    verified_messages = [
-        parse_anomaly_message(message.value)
-        for message in consumer
-        if parse_anomaly_message(message.value) is not None
-    ]
-    consumer.close()
-except Exception:
-    verified_messages = []
+verified_messages = [
+    message
+    for message in read_topic_messages("verified-events")
+    if "page_title" in message and "matched" in message
+]
 
 if verified_messages:
-    verified_df = pd.DataFrame(verified_messages)
-    verified_df["news_title"] = verified_df["matched_article"].apply(
-        lambda article: (article or {}).get("title")
+    verified_df = pd.DataFrame(
+        flatten_verified_event(message)
+        for message in verified_messages
     )
-    verified_df["news_url"] = verified_df["matched_article"].apply(
-        lambda article: (article or {}).get("url")
+
+    # flatten_verified_event() keeps a fixed field set; recent_comments
+    # rides along from the raw messages (row order is preserved 1:1).
+    verified_df["recent_comments"] = [
+        message.get("recent_comments") or ""
+        for message in verified_messages
+    ]
+
+    # The same page/window can be re-evaluated as windows update;
+    # keep only the most recent verdict for each.
+    verified_df = verified_df.drop_duplicates(
+        subset=["page_title", "window_start"], keep="last"
     )
-    if "recent_comments" not in verified_df.columns:
-        verified_df["recent_comments"] = ""
 
-    # evaluated_at (when match_events.py scored it) is always present and
-    # UTC, unlike window_end -- a more reliable recency/dedup key here.
-    verified_df["evaluated_at_ts"] = pd.to_datetime(
-        verified_df.get("evaluated_at"), errors="coerce", utc=True
-    )
-    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=ANOMALY_RECENCY_MINUTES)
-
-    # This table is for confirmed real-world events only -- unmatched
-    # verdicts (the vast majority) add no actionable signal here, so filter
-    # to matched=True before applying the usual recency/dedup treatment.
-    matched_df = verified_df[verified_df["matched"] == True]  # noqa: E712
-    recent_matched_df = matched_df[matched_df["evaluated_at_ts"] >= cutoff]
-    recent_matched_df = _dedup_latest_per_page(recent_matched_df, "evaluated_at_ts")
-else:
-    verified_df = pd.DataFrame()
-    matched_df = pd.DataFrame()
-    recent_matched_df = pd.DataFrame()
-
-if not recent_matched_df.empty:
-    recent_matched_df = recent_matched_df.sort_values(by="similarity_score", ascending=False)
-    recent_matched_df["wikipedia_url"] = recent_matched_df["page_title"].apply(
+    verified_df["wikipedia_url"] = verified_df["page_title"].apply(
         wikipedia_page_url
     )
 
+    # Verified matches first, then higher similarity first
+    # (rows with no candidate article sort last).
+    verified_df = verified_df.sort_values(
+        by=["matched", "similarity_score"],
+        ascending=[False, False],
+    )
+
+    # Each row is an aggregated page/window of Wikipedia activity,
+    # not one individual edit.
+    verified_df["window"] = [
+        format_window(start, end)
+        for start, end in zip(
+            verified_df["window_start"], verified_df["window_end"]
+        )
+    ]
+    verified_df["news_seen_at"] = pd.to_datetime(
+        verified_df["news_seen_at"], errors="coerce", utc=True
+    )
+
+    total_evaluated = len(verified_df)
+    verified_count = int(verified_df["matched"].sum())
+    below_threshold_count = int(
+        (~verified_df["matched"] & verified_df["similarity_score"].notna()).sum()
+    )
+    no_candidate_count = int(verified_df["similarity_score"].isna().sum())
+    average_verified_similarity = (
+        verified_df.loc[verified_df["matched"], "similarity_score"].mean()
+        if verified_count
+        else None
+    )
+
+    summary_1, summary_2, summary_3, summary_4, summary_5 = st.columns(5)
+    summary_1.metric("Anomalies evaluated", f"{total_evaluated:,}")
+    summary_2.metric("Verified", f"{verified_count:,}")
+    summary_3.metric("Below threshold", f"{below_threshold_count:,}")
+    summary_4.metric("No candidate article", f"{no_candidate_count:,}")
+    summary_5.metric(
+        "Avg verified similarity",
+        f"{average_verified_similarity:.3f}"
+        if average_verified_similarity is not None
+        else "—",
+    )
+
     st.dataframe(
-        recent_matched_df[
+        verified_df[
             [
                 "page_title",
                 "wikipedia_url",
-                "similarity_score",
-                "news_title",
-                "news_url",
-                "anomaly_score",
+                "window",
                 "edit_count",
+                "unique_editors",
+                "total_byte_changes",
+                "anomaly_score",
                 "recent_comments",
+                "news_title",
+                "news_domain",
+                "news_language",
+                "news_seen_at",
+                "similarity_score",
+                "similarity_threshold",
+                "status",
+                "news_url",
             ]
         ].rename(
             columns={
                 "page_title": "Wikipedia page",
                 "wikipedia_url": "Wikipedia link",
-                "similarity_score": "Similarity",
-                "news_title": "Matched news article",
-                "news_url": "URL",
+                "window": "Activity window (UTC)",
+                "edit_count": "Edits",
+                "unique_editors": "Editors",
+                "total_byte_changes": "Bytes changed",
                 "anomaly_score": "Anomaly score",
-                "edit_count": "Edit count",
                 "recent_comments": "Recent edit summaries",
+                "news_title": "Matched news",
+                "news_domain": "Source",
+                "news_language": "Language",
+                "news_seen_at": "News crawled at",
+                "similarity_score": "Similarity",
+                "similarity_threshold": "Threshold",
+                "status": "Verification",
+                "news_url": "News URL",
+            }
+        ),
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Wikipedia link": st.column_config.LinkColumn(
+                "Wikipedia link", display_text="Open page"
+            ),
+            "Recent edit summaries": st.column_config.TextColumn(
+                "Recent edit summaries", width="medium"
+            ),
+            "Matched news": st.column_config.TextColumn(
+                "Matched news", width="medium"
+            ),
+            "News URL": st.column_config.LinkColumn(
+                "News URL", display_text="Open article"
+            ),
+            "Similarity": st.column_config.NumberColumn(
+                "Similarity", format="%.3f"
+            ),
+            "Threshold": st.column_config.NumberColumn(
+                "Threshold", format="%.2f"
+            ),
+            "Anomaly score": st.column_config.NumberColumn(
+                "Anomaly score", format="%.3f"
+            ),
+            "News crawled at": st.column_config.DatetimeColumn(
+                "News crawled at", format="MMM DD HH:mm"
+            ),
+        },
+    )
+
+    st.caption(
+        "Each row is one anomalous window of Wikipedia page activity "
+        "compared against the closest recent GDELT article. Similarity "
+        "is the cosine similarity of the two title embeddings "
+        "(−1 to 1, higher is closer); the matcher marks a row Verified "
+        "when similarity ≥ its threshold. Below-threshold rows still "
+        "show the closest candidate to explain why they weren't "
+        "verified. Older records (before the payload gained editor/"
+        "byte/threshold fields) show blanks in those columns."
+    )
+elif matcher_status.get("state") == "running":
+    st.info(
+        "The news matcher is running and waiting for anomalies to "
+        "evaluate. Verdicts appear here as soon as the scorer flags "
+        "its first anomaly."
+    )
+else:
+    st.info(
+        "The news matcher is not running. Click Start Pipeline in the "
+        "sidebar to launch it (it needs the Qdrant container, which "
+        "Start Pipeline also brings up)."
+    )
+
+# ---------------------------------------------------------
+# Recent GDELT news (news-topic)
+# ---------------------------------------------------------
+
+st.subheader("Recent GDELT news")
+
+gdelt_status = status.get("GDELT news producer", {})
+
+news_messages = [
+    message
+    for message in read_topic_messages("news-topic")
+    if "title" in message and "url" in message
+]
+
+if news_messages:
+    news_df = pd.DataFrame(news_messages)
+
+    news_df["domain"] = news_df["url"].apply(
+        lambda url: urlparse(url).netloc if isinstance(url, str) else None
+    )
+
+    for time_column in ("gdelt_seen_at", "observed_at"):
+        if time_column in news_df.columns:
+            news_df[time_column] = pd.to_datetime(
+                news_df[time_column],
+                errors="coerce",
+                utc=True,
+            )
+
+    if "observed_at" in news_df.columns:
+        news_df = news_df.sort_values("observed_at", ascending=False)
+
+    display_columns = [
+        column
+        for column in (
+            "title",
+            "domain",
+            "language",
+            "gdelt_seen_at",
+            "observed_at",
+            "url",
+        )
+        if column in news_df.columns
+    ]
+
+    st.dataframe(
+        news_df.head(50)[display_columns].rename(
+            columns={
+                "title": "Title",
+                "domain": "Source",
+                "language": "Language",
+                "gdelt_seen_at": "GDELT crawled at",
+                "observed_at": "Ingested at",
+                "url": "URL",
             }
         ),
         hide_index=True,
         use_container_width=True,
         column_config={
             "URL": st.column_config.LinkColumn("URL", display_text="Open article"),
-            "Wikipedia link": st.column_config.LinkColumn(
-                "Wikipedia link", display_text="Open page"
-            ),
-            "Similarity": st.column_config.NumberColumn("Similarity", format="%.2f"),
         },
     )
+
     st.caption(
-        f"{len(recent_matched_df)} confirmed real-world event(s) (cosine "
-        f"similarity \u2265 0.7) in the last {ANOMALY_RECENCY_MINUTES} minutes, "
-        f"out of {len(verified_df)} anomalies evaluated against news so far."
+        f"Showing the 50 most recently ingested of {len(news_df)} "
+        "articles read from news-topic. \"GDELT crawled at\" is when "
+        "GDELT's crawler saw the URL — not the article's original "
+        "publication date."
     )
-elif not matched_df.empty:
+elif gdelt_status.get("state") == "running":
     st.info(
-        f"No confirmed matches in the last {ANOMALY_RECENCY_MINUTES} minutes -- "
-        f"{len(matched_df)} older confirmed match(es) exist but have aged out "
-        "of this view."
-    )
-elif not verified_df.empty:
-    st.info(
-        f"No anomalies have matched a real news article yet ({len(verified_df)} "
-        "evaluated so far, none cleared the 0.7 similarity threshold). This "
-        "table will populate as soon as one does."
+        "The GDELT producer is running and waiting for data. GDELT "
+        "publishes in roughly 15-minute heartbeat windows, so the "
+        "first articles can take several minutes to arrive."
     )
 else:
     st.info(
-        "No anomalies have been evaluated against news yet. Start "
-        "`vectordb/match_events.py` to populate this section."
+        "The GDELT news producer is not running. Click Start Pipeline "
+        "in the sidebar to launch it."
     )
 
 # ---------------------------------------------------------
-# Largest changes
+# Largest changes and latest edits (need Parquet data)
 # ---------------------------------------------------------
 
-st.subheader("Largest content changes")
+if not df.empty:
+    st.subheader("Largest content changes")
 
-positive_column, negative_column = st.columns(2)
+    positive_column, negative_column = st.columns(2)
 
-change_columns = [
-    "event_time",
-    "page_title",
-    "user",
-    "bot",
-    "byte_change",
-]
+    change_columns = [
+        "event_time",
+        "page_title",
+        "user",
+        "bot",
+        "byte_change",
+    ]
 
-with positive_column:
-    st.markdown("#### Largest additions")
+    with positive_column:
+        st.markdown("#### Largest additions")
 
-    largest_additions = (
-        df[df["byte_change"] > 0]
-        .nlargest(10, "byte_change")[change_columns]
+        largest_additions = (
+            df[df["byte_change"] > 0]
+            .nlargest(10, "byte_change")[change_columns]
+            .rename(
+                columns={
+                    "event_time": "Time",
+                    "page_title": "Page",
+                    "user": "User",
+                    "bot": "Bot",
+                    "byte_change": "Bytes",
+                }
+            )
+        )
+
+        st.dataframe(
+            largest_additions,
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    with negative_column:
+        st.markdown("#### Largest removals")
+
+        largest_removals = (
+            df[df["byte_change"] < 0]
+            .nsmallest(10, "byte_change")[change_columns]
+            .rename(
+                columns={
+                    "event_time": "Time",
+                    "page_title": "Page",
+                    "user": "User",
+                    "bot": "Bot",
+                    "byte_change": "Bytes",
+                }
+            )
+        )
+
+        st.dataframe(
+            largest_removals,
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    st.subheader("Latest Wikipedia edits")
+
+    latest_columns = [
+        "event_time",
+        "page_title",
+        "user",
+        "event_type",
+        "bot",
+        "minor",
+        "byte_change",
+        "partition",
+        "offset",
+    ]
+
+    latest_edits = (
+        df.sort_values("event_time", ascending=False)
+        .head(100)[latest_columns]
         .rename(
             columns={
                 "event_time": "Time",
                 "page_title": "Page",
                 "user": "User",
+                "event_type": "Type",
                 "bot": "Bot",
-                "byte_change": "Bytes",
+                "minor": "Minor",
+                "byte_change": "Byte change",
+                "partition": "Kafka partition",
+                "offset": "Kafka offset",
             }
         )
     )
 
     st.dataframe(
-        largest_additions,
+        latest_edits,
         hide_index=True,
         use_container_width=True,
+        height=500,
     )
 
-with negative_column:
-    st.markdown("#### Largest removals")
+    with st.expander("Dataset information"):
+        parquet_file_count = len(data_signature)
 
-    largest_removals = (
-        df[df["byte_change"] < 0]
-        .nsmallest(10, "byte_change")[change_columns]
-        .rename(
-            columns={
-                "event_time": "Time",
-                "page_title": "Page",
-                "user": "User",
-                "bot": "Bot",
-                "byte_change": "Bytes",
-            }
-        )
-    )
+        st.write(f"Parquet files: **{parquet_file_count:,}**")
+        st.write(f"Records loaded: **{len(df):,}**")
+        st.write(f"Dataset location: `{DATA_DIRECTORY}`")
 
-    st.dataframe(
-        largest_removals,
-        hide_index=True,
-        use_container_width=True,
-    )
-
-
-# ---------------------------------------------------------
-# Latest edits table
-# ---------------------------------------------------------
-
-st.subheader("Latest Wikipedia edits")
-
-latest_columns = [
-    "event_time",
-    "page_title",
-    "user",
-    "event_type",
-    "bot",
-    "minor",
-    "byte_change",
-    "partition",
-    "offset",
-]
-
-latest_edits = (
-    df.sort_values("event_time", ascending=False)
-    .head(100)[latest_columns]
-    .rename(
-        columns={
-            "event_time": "Time",
-            "page_title": "Page",
-            "user": "User",
-            "event_type": "Type",
-            "bot": "Bot",
-            "minor": "Minor",
-            "byte_change": "Byte change",
-            "partition": "Kafka partition",
-            "offset": "Kafka offset",
-        }
-    )
-)
-
-st.dataframe(
-    latest_edits,
-    hide_index=True,
-    use_container_width=True,
-    height=500,
-)
-
-
-# ---------------------------------------------------------
-# Dataset information
-# ---------------------------------------------------------
-
-with st.expander("Dataset information"):
-    parquet_file_count = len(data_signature)
-
-    st.write(f"Parquet files: **{parquet_file_count:,}**")
-    st.write(f"Records loaded: **{total_edits:,}**")
-    st.write(f"Dataset location: `{DATA_DIRECTORY}`")
-
-    st.markdown("**Available columns:**")
-    st.code("\n".join(df.columns))
+        st.markdown("**Available columns:**")
+        st.code("\n".join(df.columns))
 
 
 st.caption(

@@ -81,6 +81,8 @@ class EventVerifier:
                     "url": article.get("url"),
                     "language": article.get("language"),
                     "event_id": article.get("event_id"),
+                    "gdelt_seen_at": article.get("gdelt_seen_at"),
+                    "observed_at": article.get("observed_at"),
                 }
 
         matched = similarity_score is not None and similarity_score >= self.similarity_threshold
@@ -92,9 +94,16 @@ class EventVerifier:
             "anomaly_score": anomaly.get("anomaly_score"),
             "edit_count": anomaly.get("edit_count"),
             "recent_comments": anomaly.get("recent_comments"),
+            "unique_editors": anomaly.get("unique_editors"),
+            "total_byte_changes": anomaly.get("total_byte_changes"),
             "matched": matched,
             "similarity_score": similarity_score,
+            "similarity_threshold": self.similarity_threshold,
+            # `matched_article` keeps its documented meaning (only set when
+            # the threshold passed); `closest_article` always carries the
+            # best candidate so below-threshold verdicts remain explainable.
             "matched_article": matched_article if matched else None,
+            "closest_article": matched_article,
             "evaluated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
 

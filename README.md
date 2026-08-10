@@ -260,10 +260,14 @@ Every evaluated anomaly — matched or not — is published to the
 | `window_start` / `window_end` | The anomaly's 15-minute detection window |
 | `anomaly_score` | Score from `wikipedia-anomalies` |
 | `edit_count` | Edit count from `wikipedia-anomalies` |
+| `unique_editors` | Unique editor count from `wikipedia-anomalies` |
+| `total_byte_changes` | Total absolute byte change from `wikipedia-anomalies` |
 | `matched` | `true` if `similarity_score >= SIMILARITY_THRESHOLD` |
 | `similarity_score` | Best cosine similarity found against recent news, or `null` if the news index was empty |
-| `matched_article` | `{title, url, language, event_id}` of the best-matching article, or `null` if not matched |
 | `recent_comments` | Forwarded from `wikipedia-anomalies` for dashboard display / debugging |
+| `similarity_threshold` | The `SIMILARITY_THRESHOLD` this verdict was computed with |
+| `matched_article` | `{title, url, language, event_id, gdelt_seen_at, observed_at}` of the best-matching article — present only when `matched` is `true`, else `null` |
+| `closest_article` | Same shape as `matched_article`, but always present when the news index had any candidate — even below the threshold — so unverified anomalies stay explainable |
 | `evaluated_at` | When this script evaluated the anomaly |
 
 Optional configuration (defaults shown):

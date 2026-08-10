@@ -16,3 +16,6 @@ checkpoints/*
 
 *.log
 *.parquet
+
+# Trained model artifacts -- regenerate with: python models/train_model.py
+models/*.joblib
