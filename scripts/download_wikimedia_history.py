@@ -143,8 +143,17 @@ def main() -> None:
     parser.add_argument(
         "--limit",
         type=int,
-        default=20000,
-        help="Maximum number of historical edits to fetch",
+        default=150000,
+        help=(
+            "Maximum number of historical edits to fetch. The fetch loop "
+            "already pages through everything MediaWiki's recentchanges "
+            "table has for the requested --days window and stops early "
+            "once it runs out, so this is a ceiling, not a target -- "
+            "150000 (~7.5x the old default of 20000) pulls much closer to "
+            "the full ~30-day window instead of stopping well short of it. "
+            "Expect a few hundred paginated requests (roughly 5-10 "
+            "minutes) at the new default."
+        ),
     )
     parser.add_argument(
         "--output-dir",

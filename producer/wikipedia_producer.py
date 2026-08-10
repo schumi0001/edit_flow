@@ -75,6 +75,10 @@ def process_event(event):
         "old_length": old_length,
         "new_length": new_length,
         "byte_change": new_length - old_length,
+        # The editor's edit summary (rc_comment) -- real, if often terse,
+        # text describing what changed. Sampled downstream (see
+        # spark/ml_inference_stream.py) into anomaly records for embedding.
+        "comment": data.get("comment") or "",
         "server_name": data.get("server_name"),
         "event_type": data.get("type"),
     }

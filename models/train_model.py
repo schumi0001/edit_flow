@@ -60,11 +60,16 @@ def main():
         print(f"Training from historical file: {args.history_jsonl}")
         df = train_from_history(args.history_jsonl, model_path=model_path)
 
-    df = df.drop_duplicates(subset=["page_title"]).dropna()
-    print(f"Loaded {len(df)} pages for training.")
+    df = df.dropna()
+    distinct_pages = df["page_title"].nunique()
+    print(
+        f"Trained on {len(df)} (page, window) samples across "
+        f"{distinct_pages} distinct pages."
+    )
 
     print("\n=== LOCAL DETECTION TEST RESULTS ===")
-    print(df[["page_title", "edit_count", "total_byte_changes"]].head(10).to_string(index=False))
+    sample = df.drop_duplicates(subset=["page_title"])
+    print(sample[["page_title", "edit_count", "total_byte_changes"]].head(10).to_string(index=False))
 
 
 if __name__ == "__main__":

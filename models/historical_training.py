@@ -9,7 +9,16 @@ from typing import Optional
 FEATURES_DIR = "data/lake/features"
 MODEL_DIR = "models"
 MODEL_PATH = os.path.join(MODEL_DIR, "anomaly_detector.joblib")
-112
+
+# Must match the window duration used by the live scoring pipeline
+# (spark/ml_inference_stream.py uses a 15-minute/5-minute sliding window).
+# Training instead buckets edits into non-overlapping 15-minute tumbling
+# windows per page: this doesn't need to replicate the sliding mechanics
+# exactly, it just needs edit-volume magnitudes to be computed over a
+# comparable time span so the model's learned "normal" band is a fair
+# comparison against what's scored live, rather than against lifetime
+# (weeks-long) totals.
+WINDOW_SECONDS = 15 * 60
 
 def _read_jsonl_records(path: str) -> list[dict]:
     """Read a JSONL or gzipped JSONL file into a list of dictionaries."""
@@ -68,7 +77,18 @@ def _normalize_record(record: dict) -> dict:
 
 
 def load_historical_features_from_jsonl(path: str) -> pd.DataFrame:
-    """Build feature rows from a historical JSONL stream or gzipped archive of Wikimedia-style edit events."""
+    """Build feature rows from a historical JSONL stream or gzipped archive of Wikimedia-style edit events.
+
+    Edits are bucketed into per-page, non-overlapping WINDOW_SECONDS-wide
+    tumbling windows (rather than aggregated once per page across the
+    entire file) so that the resulting edit_count/byte-volume features are
+    on the same time scale as the live 15-minute sliding-window features
+    computed in spark/ml_inference_stream.py. Without this, a model trained
+    on lifetime totals learns "normal" as weeks' worth of activity, which
+    makes almost any real-time burst of edits look anomalous purely because
+    of the aggregation-window mismatch, not because the edits themselves
+    are actually unusual.
+    """
     records = _read_jsonl_records(path)
     if not records:
         raise ValueError(f"No records found in {path}")
@@ -85,10 +105,11 @@ def load_historical_features_from_jsonl(path: str) -> pd.DataFrame:
     df["bot"] = df["bot"].fillna(False).astype(bool)
     df["minor"] = df["minor"].fillna(False).astype(bool)
     df["byte_change"] = pd.to_numeric(df["byte_change"], errors="coerce").fillna(0)
-    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").fillna(0)
+    df["window_bucket"] = (df["timestamp"] // WINDOW_SECONDS).astype(int)
 
     features = (
-        df.groupby("page_title")
+        df.groupby(["page_title", "window_bucket"])
         .agg(
             edit_count=("page_title", "size"),
             unique_editors=("user", lambda s: s.nunique()),
@@ -97,6 +118,7 @@ def load_historical_features_from_jsonl(path: str) -> pd.DataFrame:
             minor_edit_ratio=("minor", lambda s: float(s.mean())),
         )
         .reset_index()
+        .drop(columns="window_bucket")
     )
 
     features["relative_growth"] = features["total_byte_changes"] / features["edit_count"]

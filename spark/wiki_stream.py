@@ -41,6 +41,7 @@ event_schema = StructType([
     StructField("old_length", LongType()),
     StructField("new_length", LongType()),
     StructField("byte_change", LongType()),
+    StructField("comment", StringType()),
     StructField("server_name", StringType()),
     StructField("event_type", StringType()),
 ])
@@ -52,6 +53,11 @@ kafka_stream = (
     .option("kafka.bootstrap.servers", KAFKA_SERVER)
     .option("subscribe", KAFKA_TOPIC)
     .option("startingOffsets", "latest")
+    # This is a best-effort archival sink, not a source of truth, so an
+    # offset gap (e.g. the topic got deleted/recreated since this query's
+    # checkpoint last ran) should be skipped rather than crash the whole
+    # stream -- see checkpoints/raw_wikipedia_edits.
+    .option("failOnDataLoss", "false")
     .load()
 )
 

@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pandas as pd
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, window, count, approx_count_distinct, sum, abs, when, pandas_udf
+from pyspark.sql.functions import col, from_json, window, count, approx_count_distinct, sum, abs, when, pandas_udf, udf, expr, concat_ws
 from pyspark.sql.types import (
-    BooleanType, LongType, StringType, StructField, StructType, TimestampType, DoubleType,
+    LongType, StringType, StructField, StructType, TimestampType, DoubleType, BooleanType,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from models.model_utils import load_model
+from vectordb.embeddings import substantive_comment_text
 
 KAFKA_SERVER = "localhost:9092"
 KAFKA_INPUT_TOPIC = "wikipedia-edits"
@@ -80,9 +81,17 @@ event_schema = StructType([
     StructField("old_length", LongType()),
     StructField("new_length", LongType()),
     StructField("byte_change", LongType()),
+    StructField("comment", StringType()),
     StructField("server_name", StringType()),
     StructField("event_type", StringType()),
 ])
+
+MAX_COMMENTS_PER_ANOMALY = 5
+
+# Plain (non-pandas) UDF: substantive_comment_text only imports
+# sentence_transformers lazily inside embed_text/load_model, so importing it
+# here does not pull torch/sentence-transformers into this Spark job.
+substantive_comment_udf = udf(substantive_comment_text, StringType())
 
 kafka_stream = (
     spark.readStream
@@ -101,6 +110,18 @@ cleaned_events = (
     .select("event.*")
     .filter(col("event_id").isNotNull())
     .withColumn("event_datetime", col("timestamp").cast(TimestampType()))
+    # Null out blank/jargon-only comments here (rather than post-hoc) so the
+    # collect_list aggregation below only ever sees substantive candidates.
+    # substantive_comment_udf also strips MediaWiki markup/boilerplate (wiki
+    # links, templates, auto-generated revert prefixes) from what it keeps,
+    # so recent_comments carries clean topical text, not raw wiki markup.
+    .withColumn(
+        "recent_comments_candidate",
+        when(
+            col("comment").isNotNull() & (col("comment") != ""),
+            substantive_comment_udf(col("comment")),
+        ),
+    )
 )
 
 # 4. Compute Dynamic Aggregations
@@ -116,7 +137,19 @@ features_aggregated = (
         approx_count_distinct("user").alias("unique_editors"),
         sum(abs(col("byte_change"))).alias("total_byte_changes"),
         (sum(when(col("bot") == True, 1).otherwise(0)) / count("event_id")).alias("bot_ratio"),
-        (sum(when(col("minor") == True, 1).otherwise(0)) / count("event_id")).alias("minor_edit_ratio")
+        (sum(when(col("minor") == True, 1).otherwise(0)) / count("event_id")).alias("minor_edit_ratio"),
+        # Sample a handful of real, substantive (non-jargon-only) edit
+        # summaries from this window for downstream embedding -- see
+        # vectordb.embeddings.wikipedia_anomaly_text. collect_list already
+        # skips the nulls produced by the `recent_comments_candidate` column
+        # above, so blank/jargon-only comments (e.g. "ce", "rv") never make
+        # it into recent_comments.
+        concat_ws(
+            " | ",
+            expr(
+                f"slice(collect_list(recent_comments_candidate), 1, {MAX_COMMENTS_PER_ANOMALY})"
+            ),
+        ).alias("recent_comments"),
     )
 )
 
@@ -143,7 +176,8 @@ final_alerts = (
         col("edit_count"),
         col("unique_editors"),
         col("total_byte_changes"),
-        col("anomaly_score")
+        col("anomaly_score"),
+        col("recent_comments"),
     )
 )
 

@@ -91,6 +91,7 @@ class EventVerifier:
             "window_end": anomaly.get("window_end"),
             "anomaly_score": anomaly.get("anomaly_score"),
             "edit_count": anomaly.get("edit_count"),
+            "recent_comments": anomaly.get("recent_comments"),
             "matched": matched,
             "similarity_score": similarity_score,
             "matched_article": matched_article if matched else None,

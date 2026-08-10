@@ -1,4 +1,6 @@
+import os
 from pathlib import Path
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
@@ -12,6 +14,39 @@ from pipeline_manager import (
     stop_pipeline,
 )
 from anomaly_utils import parse_anomaly_message
+
+# Anomaly/verified-event windows are 15 minutes wide and slide every 5
+# minutes, so a single page shows up as several near-duplicate messages
+# (one per overlapping window) and Kafka retains every one of them --
+# without a recency cutoff, old severe anomalies (higher |score|) would
+# permanently outrank fresher ones at the top of a score-sorted table.
+ANOMALY_RECENCY_MINUTES = int(os.environ.get("ANOMALY_RECENCY_MINUTES", "60"))
+
+# The live edit stream (producer/wikipedia_producer.py) is hardcoded to
+# English Wikipedia's recent-changes SSE feed, so page_title always
+# resolves against en.wikipedia.org.
+WIKIPEDIA_BASE_URL = "https://en.wikipedia.org/wiki/"
+
+
+def wikipedia_page_url(page_title):
+    if not page_title:
+        return None
+    return WIKIPEDIA_BASE_URL + quote(str(page_title).replace(" ", "_"))
+
+
+def _dedup_latest_per_page(df: pd.DataFrame, timestamp_column: str) -> pd.DataFrame:
+    """Keep only the most recent row per page_title.
+
+    Sliding-window aggregation re-emits the same page_title once per
+    overlapping window as it keeps accumulating edits, so the same anomaly
+    shows up several times with slightly different (always increasing)
+    stats. Keeping only the latest avoids the table filling up with near-
+    duplicates of the same underlying event.
+    """
+    return (
+        df.sort_values(timestamp_column, ascending=False)
+        .drop_duplicates(subset=["page_title"], keep="first")
+    )
 
 # ---------------------------------------------------------
 # Page configuration
@@ -380,11 +415,69 @@ except Exception:
 
 if anomaly_messages:
     anomaly_df = pd.DataFrame(anomaly_messages)
-    anomaly_df = anomaly_df.sort_values(by=["anomaly_score"], ascending=True)
+    if "recent_comments" not in anomaly_df.columns:
+        anomaly_df["recent_comments"] = ""
+
+    anomaly_df["window_end_ts"] = pd.to_datetime(
+        anomaly_df.get("window_end"), errors="coerce"
+    )
+    cutoff = pd.Timestamp.now() - pd.Timedelta(minutes=ANOMALY_RECENCY_MINUTES)
+    recent_anomaly_df = anomaly_df[anomaly_df["window_end_ts"] >= cutoff]
+    recent_anomaly_df = _dedup_latest_per_page(recent_anomaly_df, "window_end_ts")
+else:
+    anomaly_df = pd.DataFrame()
+    recent_anomaly_df = pd.DataFrame()
+
+if not recent_anomaly_df.empty:
+    # Most-recently-detected anomaly first, so the table reads like a live
+    # feed rather than a fixed leaderboard.
+    recent_anomaly_df = recent_anomaly_df.sort_values(by="window_end_ts", ascending=False)
+    recent_anomaly_df["wikipedia_url"] = recent_anomaly_df["page_title"].apply(
+        wikipedia_page_url
+    )
+    recent_anomaly_df["detected_at"] = recent_anomaly_df["window_end_ts"].dt.strftime(
+        "%Y-%m-%d %H:%M"
+    )
     st.dataframe(
-        anomaly_df[["page_title", "anomaly_score", "edit_count", "unique_editors", "total_byte_changes"]],
+        recent_anomaly_df[
+            [
+                "page_title",
+                "wikipedia_url",
+                "detected_at",
+                "anomaly_score",
+                "edit_count",
+                "unique_editors",
+                "total_byte_changes",
+                "recent_comments",
+            ]
+        ].rename(
+            columns={
+                "wikipedia_url": "Wikipedia page",
+                "detected_at": "Detected at",
+                "recent_comments": "Recent edit summaries",
+            }
+        ),
         hide_index=True,
         use_container_width=True,
+        column_config={
+            "Wikipedia page": st.column_config.LinkColumn(
+                "Wikipedia page", display_text="Open page"
+            ),
+            "Recent edit summaries": st.column_config.TextColumn(
+                "Recent edit summaries", width="large"
+            ),
+        },
+    )
+    st.caption(
+        f"{len(recent_anomaly_df)} distinct page(s) anomalous in the last "
+        f"{ANOMALY_RECENCY_MINUTES} minutes (deduplicated to each page's "
+        f"latest window; {len(anomaly_df)} total anomaly messages received)."
+    )
+elif not anomaly_df.empty:
+    st.info(
+        f"No anomalies in the last {ANOMALY_RECENCY_MINUTES} minutes -- "
+        f"{len(anomaly_df)} older anomaly message(s) exist in the topic "
+        "but have aged out of this view."
     )
 else:
     st.info("No live anomaly alerts have been emitted yet. Start the scorer and feed the live Wikimedia stream to populate this section.")
@@ -422,45 +515,83 @@ if verified_messages:
     verified_df["news_url"] = verified_df["matched_article"].apply(
         lambda article: (article or {}).get("url")
     )
-    verified_df = verified_df.sort_values(
-        by=["matched", "similarity_score"],
-        ascending=[False, False],
+    if "recent_comments" not in verified_df.columns:
+        verified_df["recent_comments"] = ""
+
+    # evaluated_at (when match_events.py scored it) is always present and
+    # UTC, unlike window_end -- a more reliable recency/dedup key here.
+    verified_df["evaluated_at_ts"] = pd.to_datetime(
+        verified_df.get("evaluated_at"), errors="coerce", utc=True
+    )
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=ANOMALY_RECENCY_MINUTES)
+
+    # This table is for confirmed real-world events only -- unmatched
+    # verdicts (the vast majority) add no actionable signal here, so filter
+    # to matched=True before applying the usual recency/dedup treatment.
+    matched_df = verified_df[verified_df["matched"] == True]  # noqa: E712
+    recent_matched_df = matched_df[matched_df["evaluated_at_ts"] >= cutoff]
+    recent_matched_df = _dedup_latest_per_page(recent_matched_df, "evaluated_at_ts")
+else:
+    verified_df = pd.DataFrame()
+    matched_df = pd.DataFrame()
+    recent_matched_df = pd.DataFrame()
+
+if not recent_matched_df.empty:
+    recent_matched_df = recent_matched_df.sort_values(by="similarity_score", ascending=False)
+    recent_matched_df["wikipedia_url"] = recent_matched_df["page_title"].apply(
+        wikipedia_page_url
     )
 
     st.dataframe(
-        verified_df[
+        recent_matched_df[
             [
                 "page_title",
-                "matched",
+                "wikipedia_url",
                 "similarity_score",
                 "news_title",
                 "news_url",
                 "anomaly_score",
                 "edit_count",
+                "recent_comments",
             ]
         ].rename(
             columns={
                 "page_title": "Wikipedia page",
-                "matched": "Confirmed real event?",
+                "wikipedia_url": "Wikipedia link",
                 "similarity_score": "Similarity",
                 "news_title": "Matched news article",
                 "news_url": "URL",
                 "anomaly_score": "Anomaly score",
                 "edit_count": "Edit count",
+                "recent_comments": "Recent edit summaries",
             }
         ),
         hide_index=True,
         use_container_width=True,
         column_config={
             "URL": st.column_config.LinkColumn("URL", display_text="Open article"),
+            "Wikipedia link": st.column_config.LinkColumn(
+                "Wikipedia link", display_text="Open page"
+            ),
             "Similarity": st.column_config.NumberColumn("Similarity", format="%.2f"),
         },
     )
-
-    matched_count = int(verified_df["matched"].sum())
     st.caption(
-        f"{matched_count} of {len(verified_df)} evaluated anomalies matched a "
-        "recent news article (cosine similarity ≥ 0.7)."
+        f"{len(recent_matched_df)} confirmed real-world event(s) (cosine "
+        f"similarity \u2265 0.7) in the last {ANOMALY_RECENCY_MINUTES} minutes, "
+        f"out of {len(verified_df)} anomalies evaluated against news so far."
+    )
+elif not matched_df.empty:
+    st.info(
+        f"No confirmed matches in the last {ANOMALY_RECENCY_MINUTES} minutes -- "
+        f"{len(matched_df)} older confirmed match(es) exist but have aged out "
+        "of this view."
+    )
+elif not verified_df.empty:
+    st.info(
+        f"No anomalies have matched a real news article yet ({len(verified_df)} "
+        "evaluated so far, none cleared the 0.7 similarity threshold). This "
+        "table will populate as soon as one does."
     )
 else:
     st.info(

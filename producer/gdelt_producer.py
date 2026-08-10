@@ -5,6 +5,19 @@ minutes at:
 
     https://storage.googleapis.com/data.gdeltproject.org/gdeltv5/weblegacy/ngrams/YYYYMMDDHHMM00.toc.json.gz
 
+and a companion tab-delimited quadgram-histogram file at the same path/
+timestamp:
+
+    https://storage.googleapis.com/data.gdeltproject.org/gdeltv5/weblegacy/ngrams/YYYYMMDDHHMM00.ngrams.txt.gz
+
+The ngrams file contains real 4-word phrases ("quadgrams") extracted from
+each article's body text, cross-referenced back to the TOC's per-article
+`ID` field via its own `DOCID` column -- see `fetch_ngrams_records` and
+`build_snippets`. This producer fetches both, so each normalized event
+carries a short real-text `snippet` alongside its `title` (title-only, i.e.
+`snippet=""`, if the ngrams file was missing or had nothing for that
+article).
+
 Files only appear during GDELT's 15-minute heartbeat windows (a handful of
 consecutive minutes, then a gap until the next quarter-hour), so most
 timestamps legitimately return HTTP 404. This producer polls a rolling
@@ -59,6 +72,8 @@ MAX_PUBLISH_ATTEMPTS = 3
 PUBLISH_TIMEOUT_SECONDS = 10
 RECENT_URL_CAPACITY = 20_000
 COMPLETED_TIMESTAMP_RETENTION_MINUTES = 180
+MAX_QUADGRAMS_PER_SNIPPET = 5
+QUADGRAM_STRIP_CHARS = " \t\r\n.,;:!?\"'()[]{}"
 
 HEADERS = {
     "User-Agent": "WikiPulse/1.0 (student big-data project)",
@@ -90,6 +105,17 @@ def toc_url(timestamp: str) -> str:
     return f"{BASE_URL}{timestamp}.toc.json.gz"
 
 
+def ngrams_url(timestamp: str) -> str:
+    """URL of the companion quadgram-histogram file for one TOC timestamp.
+
+    GDELT publishes this alongside every `.toc.json.gz` at the same path/
+    timestamp: a tab-delimited `DOCID  QUADGRAM  COUNT` file of real 4-word
+    phrases extracted from each article's body text. `DOCID` cross-
+    references the TOC record's `ID` field for that same timestamp.
+    """
+    return f"{BASE_URL}{timestamp}.ngrams.txt.gz"
+
+
 def event_id_for_url(url: str) -> str:
     """Derive a stable, deduplicating event ID from an article URL."""
     normalized = url.strip()
@@ -97,7 +123,7 @@ def event_id_for_url(url: str) -> str:
 
 
 def normalize_record(
-    record: Mapping[str, Any], timestamp: str
+    record: Mapping[str, Any], timestamp: str, snippet: str = ""
 ) -> dict[str, Any] | None:
     """Convert one raw TOC record into the stable news-topic event schema."""
     url = (record.get("url") or "").strip()
@@ -119,6 +145,11 @@ def normalize_record(
         "url": url,
         "language": record.get("lang"),
         "image_url": record.get("img") or None,
+        # A handful of real quadgrams (4-word phrases) from the article's
+        # body text, from the companion ngrams file -- "" when that file
+        # was missing/empty for this timestamp or had nothing for this
+        # DOCID. See build_snippets().
+        "snippet": snippet or "",
         "source": "gdelt_web_ngrams",
         "event_type": "article",
     }
@@ -218,9 +249,14 @@ class CompletedTimestamps:
         self.state_file.write_text(json.dumps(payload))
 
 
-def fetch_toc_records(timestamp: str) -> list[dict[str, Any]] | None:
-    """Fetch and parse one TOC file, or return None if not yet published."""
-    url = toc_url(timestamp)
+def _fetch_gz_text(url: str, label: str) -> str | None:
+    """Fetch and gunzip one GDELT file, retrying transient errors.
+
+    Returns None if the file does not exist yet (HTTP 404), or could not be
+    fetched/decompressed after MAX_FETCH_ATTEMPTS attempts. Shared by both
+    the TOC fetch and the companion ngrams fetch, which only differ in how
+    they parse the decompressed text.
+    """
     delay = INITIAL_RETRY_DELAY
 
     for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
@@ -232,10 +268,10 @@ def fetch_toc_records(timestamp: str) -> list[dict[str, Any]] | None:
             )
         except RequestException as error:
             if attempt == MAX_FETCH_ATTEMPTS:
-                print(f"Giving up on {timestamp} after {attempt} attempts: {error}")
+                print(f"Giving up on {label} after {attempt} attempts: {error}")
                 return None
             print(
-                f"Fetch error for {timestamp} (attempt {attempt}/"
+                f"Fetch error for {label} (attempt {attempt}/"
                 f"{MAX_FETCH_ATTEMPTS}): {error}. Retrying in {delay}s..."
             )
             time.sleep(delay)
@@ -248,11 +284,11 @@ def fetch_toc_records(timestamp: str) -> list[dict[str, Any]] | None:
         if response.status_code != 200:
             if attempt == MAX_FETCH_ATTEMPTS:
                 print(
-                    f"Giving up on {timestamp}: HTTP {response.status_code}"
+                    f"Giving up on {label}: HTTP {response.status_code}"
                 )
                 return None
             print(
-                f"HTTP {response.status_code} for {timestamp} "
+                f"HTTP {response.status_code} for {label} "
                 f"(attempt {attempt}/{MAX_FETCH_ATTEMPTS}). Retrying in "
                 f"{delay}s..."
             )
@@ -261,23 +297,112 @@ def fetch_toc_records(timestamp: str) -> list[dict[str, Any]] | None:
             continue
 
         try:
-            decompressed = gzip.decompress(response.content).decode("utf-8")
+            return gzip.decompress(response.content).decode("utf-8")
         except (OSError, UnicodeDecodeError) as error:
-            print(f"Failed to decompress TOC for {timestamp}: {error}")
+            print(f"Failed to decompress {label}: {error}")
             return None
 
-        records = []
-        for line in decompressed.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-        return records
-
     return None
+
+
+def fetch_toc_records(timestamp: str) -> list[dict[str, Any]] | None:
+    """Fetch and parse one TOC file, or return None if not yet published."""
+    decompressed = _fetch_gz_text(toc_url(timestamp), timestamp)
+    if decompressed is None:
+        return None
+
+    records = []
+    for line in decompressed.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records
+
+
+def fetch_ngrams_records(timestamp: str) -> list[tuple[int, str, int]] | None:
+    """Fetch and parse one companion ngrams file, or None if not yet published.
+
+    Each line is tab-delimited `DOCID  QUADGRAM  COUNT` with no header.
+    Malformed lines (wrong column count, non-integer DOCID/COUNT, empty
+    quadgram) are skipped rather than failing the whole batch, mirroring
+    fetch_toc_records's tolerance of malformed JSON lines.
+    """
+    decompressed = _fetch_gz_text(ngrams_url(timestamp), f"{timestamp} ngrams")
+    if decompressed is None:
+        return None
+
+    records: list[tuple[int, str, int]] = []
+    for line in decompressed.splitlines():
+        line = line.rstrip("\r\n")
+        if not line:
+            continue
+
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+
+        docid_str, quadgram, count_str = parts
+        quadgram = quadgram.strip()
+        if not quadgram:
+            continue
+
+        try:
+            docid = int(docid_str)
+            count = int(count_str)
+        except ValueError:
+            continue
+
+        records.append((docid, quadgram, count))
+
+    return records
+
+
+def _clean_quadgram(quadgram: str) -> str:
+    """Strip leading/trailing punctuation-only artifacts from one quadgram.
+
+    Quadgrams are extracted mid-sentence, so they often carry a trailing
+    comma or period, or other surrounding punctuation (e.g. "diseases such
+    as measles," or "disease later in life."). This only trims the outer
+    edges, leaving internal punctuation (hyphens, apostrophes) untouched.
+    """
+    return quadgram.strip(QUADGRAM_STRIP_CHARS)
+
+
+def build_snippets(
+    ngram_records: list[tuple[int, str, int]] | None,
+    max_quadgrams: int = MAX_QUADGRAMS_PER_SNIPPET,
+) -> dict[int, str]:
+    """Group quadgrams by DOCID into one short snippet string per article.
+
+    Keeps the highest-COUNT, deduplicated (after cleaning) quadgrams per
+    DOCID, up to `max_quadgrams`. GDELT's own docs describe this dataset as
+    "quadgram frequency histograms," not full sentences, so a snippet is
+    always a handful of short, possibly overlapping four-word fragments --
+    never fluent text.
+    """
+    if not ngram_records:
+        return {}
+
+    counts_by_docid: dict[int, dict[str, int]] = {}
+    for docid, quadgram, count in ngram_records:
+        cleaned = _clean_quadgram(quadgram)
+        if not cleaned:
+            continue
+        counts = counts_by_docid.setdefault(docid, {})
+        counts[cleaned] = counts.get(cleaned, 0) + count
+
+    snippets: dict[int, str] = {}
+    for docid, counts in counts_by_docid.items():
+        top_quadgrams = sorted(
+            counts.items(), key=lambda item: item[1], reverse=True
+        )[:max_quadgrams]
+        snippets[docid] = " ".join(quadgram for quadgram, _ in top_quadgrams)
+
+    return snippets
 
 
 class GdeltIngestionProducer:
@@ -344,9 +469,16 @@ class GdeltIngestionProducer:
         if records is None:
             return 0
 
+        # Best-effort: the companion ngrams file is a separate fetch and can
+        # legitimately be missing/empty even when the TOC published fine, in
+        # which case every article just falls back to title-only text.
+        snippets = build_snippets(fetch_ngrams_records(timestamp))
+
         sent = 0
         for record in records:
-            event = normalize_record(record, timestamp)
+            docid = record.get("ID")
+            snippet = snippets.get(docid, "") if docid is not None else ""
+            event = normalize_record(record, timestamp, snippet=snippet)
             if event is None:
                 continue
             if not matches_language(event, self.languages):

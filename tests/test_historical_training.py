@@ -4,7 +4,7 @@ import tempfile
 import json
 import unittest
 
-from models.historical_training import load_historical_features_from_jsonl
+from models.historical_training import WINDOW_SECONDS, load_historical_features_from_jsonl
 
 
 class HistoricalTrainingTests(unittest.TestCase):
@@ -83,6 +83,63 @@ class HistoricalTrainingTests(unittest.TestCase):
 
             self.assertEqual(len(df), 1)
             self.assertEqual(int(df.loc[df["page_title"] == "Gamma", "edit_count"].iloc[0]), 2)
+
+    def test_edits_in_different_windows_are_not_merged(self):
+        """Two edits to the same page far apart in time should become two
+        separate feature rows (one per window), not a single lifetime-total
+        row -- this is what keeps training features on the same time scale
+        as the live 15-minute-window inference features."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "history.jsonl")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps({
+                        "page_title": "Delta",
+                        "user": "u1",
+                        "bot": False,
+                        "minor": False,
+                        "byte_change": 100,
+                        "timestamp": 0,
+                    }) + "\n"
+                )
+                handle.write(
+                    json.dumps({
+                        "page_title": "Delta",
+                        "user": "u2",
+                        "bot": False,
+                        "minor": False,
+                        "byte_change": 200,
+                        "timestamp": WINDOW_SECONDS * 10,
+                    }) + "\n"
+                )
+
+            df = load_historical_features_from_jsonl(path)
+
+            delta_rows = df[df["page_title"] == "Delta"]
+            self.assertEqual(len(delta_rows), 2)
+            self.assertTrue((delta_rows["edit_count"] == 1).all())
+
+    def test_edits_within_same_window_are_merged(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "history.jsonl")
+            with open(path, "w", encoding="utf-8") as handle:
+                for i in range(3):
+                    handle.write(
+                        json.dumps({
+                            "page_title": "Epsilon",
+                            "user": f"u{i}",
+                            "bot": False,
+                            "minor": False,
+                            "byte_change": 10,
+                            "timestamp": i,
+                        }) + "\n"
+                    )
+
+            df = load_historical_features_from_jsonl(path)
+
+            epsilon_rows = df[df["page_title"] == "Epsilon"]
+            self.assertEqual(len(epsilon_rows), 1)
+            self.assertEqual(int(epsilon_rows["edit_count"].iloc[0]), 3)
 
 
 if __name__ == "__main__":

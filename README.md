@@ -1,8 +1,14 @@
 # WikiPulse
 
+Streaming Wikipedia edit-anomaly detection with GDELT news verification
+(Kafka + Spark Structured Streaming + Isolation Forest + Qdrant embeddings).
+
+For a report-oriented write-up of the embedding enrichment, windowed training
+fix, and validation analysis, see [`docs/PROJECT_REPORT.md`](docs/PROJECT_REPORT.md).
+
 ## Run
 
-Requirements: Python 3.12, Java, and Docker Desktop.
+Requirements: Python 3.11+ (3.12 also fine), Java 17, and Docker Desktop.
 
 ```bash
 git clone YOUR_GITHUB_REPOSITORY_URL
@@ -129,6 +135,7 @@ Each message on `news-topic` is a JSON object with these fields:
 |---|---|
 | `event_id` | Stable SHA-256 hash of the article URL; used as the Kafka key and for dedup |
 | `title` | Article headline |
+| `snippet` | A handful of real quadgrams (4-word phrases) pulled from the article's body text via GDELT's companion `.ngrams.txt.gz` file for this batch, cross-referenced by DOCID -- `""` if that file was missing or had nothing for this article. Used alongside `title` for embedding (see `vectordb/embeddings.py`); not full article text, only short possibly-overlapping fragments. |
 | `url` | Article URL |
 | `language` | GDELT-reported language code (e.g. `en`, `es`, `zh`) |
 | `image_url` | Article thumbnail image, if GDELT reported one (else `null`) |
@@ -153,7 +160,7 @@ First, fetch real historical edits from the MediaWiki `recentchanges` API (one-t
 ```bash
 python scripts/download_wikimedia_history.py
 ```
-This writes `data/historical/en.wikipedia.org.recentchanges.jsonl` and trains from it immediately.
+This writes `data/historical/en.wikipedia.org.recentchanges.jsonl` and trains from it immediately. By default it pages through up to 150,000 edits (roughly 5-10 minutes, a few hundred paginated requests) to get much closer to the full ~30-day window MediaWiki's `recentchanges` table retains, rather than stopping well short of it. Pass `--limit` to fetch fewer (faster) or more.
 
 To train again later without re-downloading:
 ```bash
@@ -165,11 +172,29 @@ There is also a `--feature-lake` flag that trains from whatever has accumulated 
 
 This trains an Isolation Forest pipeline offline and saves it to `models/anomaly_detector.joblib`.
 
-**3. Start the offline scikit-learn scorer** — start this *before* step 4, since it reads Kafka from `latest` and will not see edits published before it starts:
+Training features are computed per (page, 15-minute window) rather than per page over the whole historical file, since that's the same granularity `spark/ml_inference_stream.py` scores live (see step 3). Aggregating lifetime totals instead would teach the model that "normal" edit volume looks like weeks' worth of activity, which makes almost any real-time burst look anomalous purely from the mismatch in time scale, not because it's actually unusual. Re-running `download_wikimedia_history.py` or `train_model.py` after this change requires restarting `spark/ml_inference_stream.py` (it loads the model into memory once at startup and won't pick up a newer file on disk).
+
+**3. Start the offline scikit-learn scorer** — start this *before* step 4, since it reads Kafka from `latest` and will not see edits published before it starts.
+
+If your shell’s default `python` is a different minor version than the project
+venv (common when Homebrew Python 3.13 coexists with a 3.11 venv), point Spark
+workers at the venv first:
+
 ```bash
+export PYSPARK_PYTHON="$(pwd)/.venv/bin/python"
+export PYSPARK_DRIVER_PYTHON="$(pwd)/.venv/bin/python"
 python spark/ml_inference_stream.py
 ```
-Leave this running. It reads `wikipedia-edits` from Kafka, aggregates events into 15-minute windows, scores each page with the saved scikit-learn model, and writes flagged anomalies to the `wikipedia-anomalies` topic.
+
+Leave this running. It reads `wikipedia-edits` from Kafka, aggregates events into 15-minute windows, scores each page with the saved scikit-learn model, and writes flagged anomalies to the `wikipedia-anomalies` topic:
+
+| Field | Meaning |
+|---|---|
+| `page_title` | The flagged Wikipedia page |
+| `window_start` / `window_end` | The anomaly's 15-minute detection window |
+| `edit_count` / `unique_editors` / `total_byte_changes` | Aggregated edit-activity features for this page and window |
+| `anomaly_score` | Isolation Forest decision-function score (negative = flagged as anomalous) |
+| `recent_comments` | Up to 5 real, substantive edit summaries (`comment` from the Wikimedia stream) sampled from this window, joined with `" \| "`. Blank, editing-jargon-only (e.g. `"ce"`, `"rv"`), and generic maintenance/boilerplate-only summaries (e.g. `"created article"`, `"/* See also */"`) are filtered out first; MediaWiki markup (wikilinks, templates, auto-generated revert/rollback prefixes) is stripped from the ones that remain, so this carries clean topical text rather than raw wiki syntax (see `vectordb/embeddings.substantive_comment_text`). `""` if none of this window's comments were substantive. Used alongside `page_title` for embedding (see `vectordb/embeddings.py`). |
 
 **4. Feed it live data** — this is the step that actually publishes to the `wikipedia-edits` Kafka topic that step 3 reads from:
 ```bash
@@ -204,10 +229,13 @@ anomaly searches that index for the closest recent match. A cosine
 similarity of at least `SIMILARITY_THRESHOLD` (default `0.7`) is treated as
 confirmation that the anomaly corresponds to a real, concurrent news event.
 
-Both topics currently only carry titles (no article body or edit diff
-text), so this is title-vs-title semantic matching for now — e.g. Wikipedia
-page `2026_California_wildfires` vs. a GDELT article titled "Wildfires
-force evacuations in LA County".
+Both sides also carry a bit of real body text beyond the bare title —
+`news-topic`'s `snippet` (real quadgrams from the article body) and
+`wikipedia-anomalies`' `recent_comments` (real edit summaries) — see the
+schema tables above and `vectordb/embeddings.py`. Even so, this is still
+largely title-driven semantic matching — e.g. Wikipedia page
+`2026_California_wildfires` vs. a GDELT article titled "Wildfires force
+evacuations in LA County".
 
 Start Qdrant (it's part of the same Compose file as Kafka):
 ```bash
@@ -235,6 +263,7 @@ Every evaluated anomaly — matched or not — is published to the
 | `matched` | `true` if `similarity_score >= SIMILARITY_THRESHOLD` |
 | `similarity_score` | Best cosine similarity found against recent news, or `null` if the news index was empty |
 | `matched_article` | `{title, url, language, event_id}` of the best-matching article, or `null` if not matched |
+| `recent_comments` | Forwarded from `wikipedia-anomalies` for dashboard display / debugging |
 | `evaluated_at` | When this script evaluated the anomaly |
 
 Optional configuration (defaults shown):
