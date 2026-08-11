@@ -25,7 +25,7 @@ def parse_anomaly_message(payload):
 
 
 def flatten_verified_event(record):
-    """Flatten one verified-events message into flat display fields.
+    """Flatten one anomaly-news-verdicts message into flat display fields.
 
     Backward compatible with older messages, which lack unique_editors,
     total_byte_changes, similarity_threshold, and closest_article (those

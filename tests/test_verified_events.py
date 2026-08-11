@@ -132,7 +132,7 @@ class VerifiedEventPayloadTests(unittest.TestCase):
         record = verifier.handle_anomaly(dict(ANOMALY))
 
         topic, key, value = verifier.kafka.sent[-1]
-        self.assertEqual(topic, "verified-events")
+        self.assertEqual(topic, "anomaly-news-verdicts")
         self.assertEqual(key, ANOMALY["page_title"])
         self.assertEqual(value, record)
 

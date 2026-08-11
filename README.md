@@ -49,16 +49,17 @@ export GDELT_POLL_INTERVAL_SECONDS="60"
 export GDELT_LOOKBACK_MINUTES="45"
 export GDELT_SAFETY_DELAY_MINUTES="5"
 export GDELT_STATE_FILE=".runtime/gdelt_producer_state.json"
-export GDELT_LANGUAGES=""      # e.g. "en" or "en,es" — empty means no language filter
+export GDELT_LANGUAGES="en"    # default; use "en,es" for multiple, or "" for no language filter
 ```
 
 `GDELT_LANGUAGES` keeps only articles whose GDELT-reported language code
-(e.g. `en`, `es`, `zh`) is in this comma-separated list. This is a scope
-filter, not a relevance filter: it exists so articles line up with whatever
-Wikipedia language and embedding model the downstream similarity search
-uses, not to guess which articles are topically related to a given
-anomaly. Deciding relevance is intentionally left to the embedding /
-cosine-similarity stage, which can catch semantic matches (e.g. "wildfire"
+(e.g. `en`, `es`, `zh`) is in this comma-separated list. It defaults to
+`en` so news lines up with English Wikipedia. This is a scope filter, not a
+relevance filter: it exists so articles match whatever embedding model and
+Wikipedia-language pairing the downstream similarity search uses, not to
+guess which articles are topically related to a given anomaly. Deciding
+relevance is intentionally left to the embedding / cosine-similarity stage,
+which can catch semantic matches (e.g. "wildfire"
 vs. "blaze") that a keyword filter at ingestion time would miss.
 
 The producer polls a rolling window of recent minute-resolution timestamps.
@@ -252,7 +253,8 @@ cached locally after that. Qdrant's own data is persisted in a Docker
 volume, so the news index survives restarts of `match_events.py` itself.
 
 Every evaluated anomaly — matched or not — is published to the
-`verified-events` Kafka topic, keyed by `page_title`:
+`anomaly-news-verdicts` Kafka topic (an evaluation log, not matches-only),
+keyed by `page_title`:
 
 | Field | Meaning |
 |---|---|
@@ -275,7 +277,7 @@ Optional configuration (defaults shown):
 export KAFKA_SERVER="localhost:9092"
 export GDELT_KAFKA_TOPIC="news-topic"
 export ANOMALY_KAFKA_TOPIC="wikipedia-anomalies"
-export VERIFIED_KAFKA_TOPIC="verified-events"
+export VERIFIED_KAFKA_TOPIC="anomaly-news-verdicts"
 export SIMILARITY_THRESHOLD="0.7"
 export NEWS_RETENTION_HOURS="24"   # how far back to keep news embeddings for matching
 export EMBEDDING_MODEL="all-MiniLM-L6-v2"
@@ -286,7 +288,7 @@ To check the output:
 ```bash
 python -c "
 from kafka import KafkaConsumer
-c = KafkaConsumer('verified-events', bootstrap_servers='localhost:9092', auto_offset_reset='earliest', consumer_timeout_ms=8000)
+c = KafkaConsumer('anomaly-news-verdicts', bootstrap_servers='localhost:9092', auto_offset_reset='earliest', consumer_timeout_ms=8000)
 for msg in c:
     print(msg.value.decode())
 "

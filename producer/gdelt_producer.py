@@ -29,10 +29,11 @@ Deciding whether an article is *relevant* to a given Wikipedia anomaly is
 intentionally out of scope here. That judgment belongs to the downstream
 embedding / cosine-similarity stage, which can match semantically related
 articles that a lexical keyword filter would miss. The only filtering
-performed at this layer is an optional language restriction (GDELT_LANGUAGES),
-which exists to keep articles in scope for whatever embedding model and
-Wikipedia-language pairing downstream consumers use -- not to judge topical
-relevance.
+performed at this layer is an optional language restriction (GDELT_LANGUAGES,
+default ``en`` to match English Wikipedia), which exists to keep articles in
+scope for whatever embedding model and Wikipedia-language pairing downstream
+consumers use -- not to judge topical relevance. Set ``GDELT_LANGUAGES`` to
+an empty string to disable the filter.
 """
 
 import gzip
@@ -62,7 +63,7 @@ DEFAULT_POLL_INTERVAL_SECONDS = 60
 DEFAULT_LOOKBACK_MINUTES = 45
 DEFAULT_SAFETY_DELAY_MINUTES = 5
 DEFAULT_STATE_FILE = ".runtime/gdelt_producer_state.json"
-DEFAULT_LANGUAGES = ""
+DEFAULT_LANGUAGES = "en"
 
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_FETCH_ATTEMPTS = 3

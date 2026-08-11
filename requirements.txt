@@ -6,7 +6,6 @@ streamlit
 pandas
 pyarrow
 psutil
-streamlit-autorefresh
 scikit-learn
 sentence-transformers
 qdrant-client

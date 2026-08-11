@@ -9,9 +9,10 @@ match. A cosine similarity >= SIMILARITY_THRESHOLD is treated as
 confirmation that the anomaly corresponds to a real, concurrent news event.
 
 Every evaluated anomaly (matched or not) is published to the
-`verified-events` Kafka topic, not just the ones that pass the threshold --
-that keeps the negative signal (an anomaly with no news match) available
-too, e.g. for a downstream "% of anomalies confirmed as real" metric.
+`anomaly-news-verdicts` Kafka topic, not just the ones that pass the
+threshold -- that keeps the negative signal (an anomaly with no news
+match) available too, e.g. for a downstream "% of anomalies confirmed
+as real" metric.
 """
 
 import json
@@ -33,7 +34,7 @@ from vectordb.news_index import NewsEmbeddingIndex, DEFAULT_RETENTION_HOURS
 DEFAULT_KAFKA_SERVER = "localhost:9092"
 DEFAULT_NEWS_TOPIC = "news-topic"
 DEFAULT_ANOMALY_TOPIC = "wikipedia-anomalies"
-DEFAULT_VERIFIED_TOPIC = "verified-events"
+DEFAULT_VERIFIED_TOPIC = "anomaly-news-verdicts"
 DEFAULT_SIMILARITY_THRESHOLD = 0.7
 
 PUBLISH_TIMEOUT_SECONDS = 10

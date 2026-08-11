@@ -199,7 +199,7 @@ GDELT TOC+ngrams ──► gdelt_producer ──► kafka:news-topic
                                    match_events (+ Qdrant)
                                               │
                                               ▼
-                                   kafka:verified-events
+                                   kafka:anomaly-news-verdicts
                                               │
                                               ▼
                                       Streamlit dashboard
@@ -226,16 +226,85 @@ Qualitative / quantitative checks from the windowed retrain session:
 - Retrained model self-flags **1.00%** of training windows (matches
   contamination setting).
 - Live pipeline continued publishing to `wikipedia-anomalies` and
-  `verified-events` after restart with the new model.
+  `anomaly-news-verdicts` after restart with the new model.
 - Example score movement under the new model (illustrative of
   `relative_growth` / burst sensitivity, not a claim of news confirmation):
   - large page-creation style vectors remained clearly anomalous;
   - multi-edit high-byte windows scored more strongly anomalous once
     compared to other 15-minute windows rather than lifetime totals.
 
-News confirmation (`matched: true` on `verified-events`) remains sparse by
-design: it requires concurrent topical overlap between a statistical edit
+News confirmation (`matched: true` on `anomaly-news-verdicts`) remains sparse
+by design: it requires concurrent topical overlap between a statistical edit
 burst and recent GDELT articles above `SIMILARITY_THRESHOLD` (default 0.7).
+(The topic was renamed from `verified-events` to reflect that it stores all
+verdicts, including `matched: false`.)
+
+### 7.1 Finding: sparse overlap between Wikipedia edits and GDELT news
+
+A consistent live-run observation is that the two feeds mostly **do not
+line up**:
+
+1. **Most Wikimedia edits we capture are routine activity on already-
+   established pages** (maintenance, formatting, sports/box-score style
+   updates, quiet article growth). Those edits usually do **not** match a
+   concurrent GDELT article above the similarity threshold — i.e. they are
+   not behaving like “breaking news just hit the page.”
+2. **Most GDELT articles never appear as a verified anomaly.** The news
+   firehose is large; only a small fraction coincide with a statistically
+   anomalous Wikipedia edit burst on a topically similar page.
+
+So the dashboard’s “Recent GDELT news” table being much fuller than
+“Anomalies verified against real news” is expected, not a pipeline failure.
+Verified rows are the rare intersection: a sharp wiki burst *and* a close
+news match (e.g. `2026 Colombia earthquake` ↔ a quake headline).
+
+**What we can and cannot claim**
+
+| Fair claim from this system | Overclaim to avoid |
+|---|---|
+| Under our anomaly + embedding match definition, wiki↔news correlation is sparse. | “Wikipedia pages were never updated for that story” (we only see *anomalous* bursts, not every quiet edit). |
+| Most captured edits do not look like news-driven spikes. | “Most edits are to very old pages” as a measured result (we do not score page age). |
+| Most news items never clear verification. | “Those stories have no Wikipedia page at all.” |
+
+**Which comes first — Wikipedia or mainstream news?**
+
+This pipeline cannot settle a societal “chicken or egg” by itself: the two
+streams are ingested **independently**, and verification only checks
+**near-simultaneous topical overlap**, not causal order. Qualitatively,
+though, the sparse intersection fits a common pattern for breaking events:
+
+- mainstream outlets often publish first;
+- Wikipedia editors then update (or create) articles, sometimes in a burst
+  that our anomaly detector can see;
+- the reverse also happens (wiki maintenance with no news; news with no
+  wiki spike).
+
+In that sense WikiPulse is less “which medium leads society?” and more
+“when do both move together loudly enough to detect?” — and the empirical
+answer from our runs is: **rarely, and those rare cases are the interesting
+ones.**
+
+### 7.2 Example: sliding windows vs. one news article
+
+Live Spark scoring uses a **15-minute window that slides every 5 minutes**.
+While a breaking-news page keeps receiving edits, the scorer re-emits that
+page for each overlapping window (e.g. 10:10–10:25, then 10:15–10:30, then
+10:20–10:35). The news matcher evaluates **each emission independently**,
+so the same GDELT article can appear multiple times with slightly different
+cosine similarities as the window’s edit count / `recent_comments` (and thus
+the anomaly embedding) change.
+
+**Observed example (2026-08-11, live run):**
+
+| Wikipedia page | Matched news (GDELT) | Example windows (UTC) | Similarity range |
+|---|---|---|---|
+| `2026 Colombia earthquake` | “A 7.4-magnitude earthquake shakes western Colombia, leaving 2 dead” | 10:10–10:25, 10:15–10:30, 10:20–10:35 (re-emitted as edit_count grew from ~5 → ~12) | ~0.80–0.85 |
+
+Kafka correctly retains every evaluation. For the dashboard’s “Anomalies
+verified against real news” table we **dedupe to one row per
+`page_title`, keeping the latest `window_end`**, so operators see the
+current match rather than a stack of near-duplicate sliding-window
+updates for the same story.
 
 ## 8. Limitations and future work
 
