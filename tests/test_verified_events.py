@@ -72,7 +72,7 @@ def fake_embed(text):
     return np.zeros(3)
 
 
-def build_verifier(match, threshold=0.7):
+def build_verifier(match, threshold=0.65):
     return EventVerifier(
         kafka_producer=FakeKafkaProducer(),
         index=FakeIndex(match=match),
@@ -89,7 +89,7 @@ class VerifiedEventPayloadTests(unittest.TestCase):
 
         self.assertTrue(record["matched"])
         self.assertEqual(record["similarity_score"], 0.83)
-        self.assertEqual(record["similarity_threshold"], 0.7)
+        self.assertEqual(record["similarity_threshold"], 0.65)
         self.assertEqual(record["edit_count"], 42)
         self.assertEqual(record["unique_editors"], 17)
         self.assertEqual(record["total_byte_changes"], 90210)
@@ -143,7 +143,7 @@ class FlattenVerifiedEventTests(unittest.TestCase):
             **ANOMALY,
             "matched": True,
             "similarity_score": 0.83,
-            "similarity_threshold": 0.7,
+            "similarity_threshold": 0.65,
             "matched_article": dict(ARTICLE),
             "closest_article": dict(ARTICLE),
             "evaluated_at": "2026-08-10T14:46:00Z",
@@ -156,7 +156,7 @@ class FlattenVerifiedEventTests(unittest.TestCase):
         self.assertEqual(row["news_domain"], "news.example.com")
         self.assertEqual(row["news_language"], "en")
         self.assertEqual(row["news_seen_at"], ARTICLE["gdelt_seen_at"])
-        self.assertEqual(row["similarity_threshold"], 0.7)
+        self.assertEqual(row["similarity_threshold"], 0.65)
         self.assertEqual(row["unique_editors"], 17)
         self.assertEqual(row["total_byte_changes"], 90210)
 
@@ -165,7 +165,7 @@ class FlattenVerifiedEventTests(unittest.TestCase):
             **ANOMALY,
             "matched": False,
             "similarity_score": 0.41,
-            "similarity_threshold": 0.7,
+            "similarity_threshold": 0.65,
             "matched_article": None,
             "closest_article": dict(ARTICLE),
         }

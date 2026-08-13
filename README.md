@@ -227,7 +227,7 @@ a real news event driving edits, or vandalism/an edit war/bot activity.
 and `news-topic` (using a local `sentence-transformers` model — no API key),
 storing news embeddings in [Qdrant](https://qdrant.tech/), and for each
 anomaly searches that index for the closest recent match. A cosine
-similarity of at least `SIMILARITY_THRESHOLD` (default `0.7`) is treated as
+similarity of at least `SIMILARITY_THRESHOLD` (default `0.65`) is treated as
 confirmation that the anomaly corresponds to a real, concurrent news event.
 
 Both sides also carry a bit of real body text beyond the bare title —
@@ -278,7 +278,7 @@ export KAFKA_SERVER="localhost:9092"
 export GDELT_KAFKA_TOPIC="news-topic"
 export ANOMALY_KAFKA_TOPIC="wikipedia-anomalies"
 export VERIFIED_KAFKA_TOPIC="anomaly-news-verdicts"
-export SIMILARITY_THRESHOLD="0.7"
+export SIMILARITY_THRESHOLD="0.65"
 export NEWS_RETENTION_HOURS="24"   # how far back to keep news embeddings for matching
 export EMBEDDING_MODEL="all-MiniLM-L6-v2"
 export QDRANT_URL="http://localhost:6333"

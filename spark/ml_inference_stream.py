@@ -4,7 +4,22 @@ from pathlib import Path
 
 import pandas as pd
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, window, count, approx_count_distinct, sum, abs, when, pandas_udf, udf, expr, concat_ws
+from pyspark.sql.functions import (
+    col,
+    from_json,
+    window,
+    count,
+    approx_count_distinct,
+    sum,
+    abs,
+    when,
+    pandas_udf,
+    udf,
+    expr,
+    concat_ws,
+    date_format,
+    max as spark_max,
+)
 from pyspark.sql.types import (
     LongType, StringType, StructField, StructType, TimestampType, DoubleType, BooleanType,
 )
@@ -32,6 +47,10 @@ spark = (
     .config("spark.driver.memory", "512m")
     .config("spark.sql.shuffle.partitions", "4")
     .config("spark.ui.enabled", "false")
+    # Emit window bounds as UTC. The default JVM local zone made
+    # Timestamp.cast("string") look like Eastern wall time with no
+    # offset, and the dashboard then treated those strings as UTC.
+    .config("spark.sql.session.timeZone", "UTC")
     .getOrCreate()
 )
 spark.sparkContext.setLogLevel("WARN")
@@ -138,6 +157,10 @@ features_aggregated = (
         sum(abs(col("byte_change"))).alias("total_byte_changes"),
         (sum(when(col("bot") == True, 1).otherwise(0)) / count("event_id")).alias("bot_ratio"),
         (sum(when(col("minor") == True, 1).otherwise(0)) / count("event_id")).alias("minor_edit_ratio"),
+        # Latest Wikimedia edit time in this window (unix event timestamp),
+        # so the dashboard can show when the page was actually edited
+        # rather than the sliding-window boundary.
+        spark_max("event_datetime").alias("last_edit_time"),
         # Sample a handful of real, substantive (non-jargon-only) edit
         # summaries from this window for downstream embedding -- see
         # vectordb.embeddings.wikipedia_anomaly_text. collect_list already
@@ -171,8 +194,17 @@ final_alerts = (
     .filter(col("anomaly_score") < 0.0)
     .select(
         col("page_title"),
-        col("window.start").cast("string").alias("window_start"),
-        col("window.end").cast("string").alias("window_end"),
+        # ISO-8601 UTC with Z so consumers can parse unambiguously
+        # (legacy messages used naive local-zone strings).
+        date_format(col("window.start"), "yyyy-MM-dd'T'HH:mm:ss'Z'").alias(
+            "window_start"
+        ),
+        date_format(col("window.end"), "yyyy-MM-dd'T'HH:mm:ss'Z'").alias(
+            "window_end"
+        ),
+        date_format(col("last_edit_time"), "yyyy-MM-dd'T'HH:mm:ss'Z'").alias(
+            "last_edit_time"
+        ),
         col("edit_count"),
         col("unique_editors"),
         col("total_byte_changes"),

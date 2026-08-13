@@ -17,12 +17,6 @@ from pipeline_manager import (
 )
 from anomaly_utils import flatten_verified_event, parse_anomaly_message
 
-# Anomaly windows are 15 minutes wide and slide every 5 minutes, so the
-# same page re-emits often. Alerts use all messages read from the topic,
-# dedupe to the latest window per page, then show at most this many rows
-# (search filters the full unique-page set before the cap).
-ANOMALY_TABLE_MAX_ROWS = int(os.environ.get("ANOMALY_TABLE_MAX_ROWS", "20"))
-
 # The live edit stream (producer/wikipedia_producer.py) is hardcoded to
 # English Wikipedia's recent-changes SSE feed, so page_title always
 # resolves against en.wikipedia.org.
@@ -47,6 +41,36 @@ def to_eastern(values):
     if pd.isna(ts):
         return ts
     return ts.tz_convert(DISPLAY_TZ)
+
+
+def parse_anomaly_window_time(values):
+    """Parse Spark anomaly window_start / window_end strings to UTC.
+
+    Spark's Timestamp.cast("string") formats in spark.sql.session.timeZone
+    with no offset. On this project that was the JVM local zone
+    (America/New_York), so legacy Kafka values like ``2026-08-11 15:55:00``
+    are Eastern wall times — treating them as UTC made "Detected at" look
+    ~4 hours early. Newer inference emits ISO-8601 UTC with a trailing Z;
+    those parse as UTC directly.
+    """
+    def _parse_one(value):
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return pd.NaT
+        text = str(value).strip()
+        if not text:
+            return pd.NaT
+        if text.endswith("Z") or "T" in text:
+            return pd.to_datetime(text, utc=True, errors="coerce")
+        ts = pd.to_datetime(text, errors="coerce")
+        if pd.isna(ts):
+            return ts
+        if getattr(ts, "tzinfo", None) is not None:
+            return ts.tz_convert("UTC")
+        return ts.tz_localize(DISPLAY_TZ).tz_convert("UTC")
+
+    if isinstance(values, pd.Series):
+        return values.map(_parse_one)
+    return _parse_one(values)
 
 
 def format_eastern_timestamp(values, fmt="%Y-%m-%d %H:%M ET"):
@@ -156,10 +180,12 @@ def read_topic_messages(topic, limit=400, timeout_ms=3000, keep_matched=False):
 def format_window(start, end):
     """Render a page/window pair in Eastern Time, e.g. 'Aug 10 10:30 – 10:45 ET'."""
     try:
-        start_time = to_eastern(start)
-        end_time = to_eastern(end)
-        if pd.isna(start_time) or pd.isna(end_time):
+        start_utc = parse_anomaly_window_time(start)
+        end_utc = parse_anomaly_window_time(end)
+        if pd.isna(start_utc) or pd.isna(end_utc):
             raise ValueError
+        start_time = start_utc.tz_convert(DISPLAY_TZ)
+        end_time = end_utc.tz_convert(DISPLAY_TZ)
         return f"{start_time:%b %d %H:%M} – {end_time:%H:%M} ET"
     except (ValueError, TypeError):
         if start or end:
@@ -548,25 +574,58 @@ def render_live_tables():
         if "recent_comments" not in anomaly_df.columns:
             anomaly_df["recent_comments"] = ""
 
-        anomaly_df["window_end_ts"] = pd.to_datetime(
-            anomaly_df.get("window_end"), errors="coerce", utc=True
+        anomaly_df["window_end_ts"] = parse_anomaly_window_time(
+            anomaly_df.get("window_end")
         )
-        pages_df = _dedup_latest_per_page(anomaly_df, "window_end_ts")
-        pages_df = pages_df.sort_values(by="window_end_ts", ascending=False)
+        if "last_edit_time" in anomaly_df.columns:
+            last_edit_ts = parse_anomaly_window_time(
+                anomaly_df["last_edit_time"]
+            )
+        else:
+            last_edit_ts = pd.Series(pd.NaT, index=anomaly_df.index)
+        anomaly_df["last_edit_ts"] = pd.to_datetime(
+            last_edit_ts, utc=True, errors="coerce"
+        )
+
+        # Until the scorer is restarted with last_edit_time on the Kafka
+        # payload, fill from the live Parquet edit lake (latest edit per
+        # page title seen by this pipeline).
+        missing_edit = anomaly_df["last_edit_ts"].isna()
+        if (
+            missing_edit.any()
+            and not df.empty
+            and "page_title" in df.columns
+            and "event_time" in df.columns
+        ):
+            page_last_edit = (
+                df.dropna(subset=["page_title", "event_time"])
+                .groupby("page_title", sort=False)["event_time"]
+                .max()
+            )
+            filled = anomaly_df.loc[missing_edit, "page_title"].map(
+                page_last_edit
+            )
+            anomaly_df.loc[missing_edit, "last_edit_ts"] = pd.to_datetime(
+                filled, utc=True, errors="coerce"
+            )
+
+        # Prefer last Wikimedia edit time for ordering; fall back to window
+        # end when neither Kafka nor Parquet has an edit timestamp.
+        anomaly_df["sort_ts"] = anomaly_df["last_edit_ts"].fillna(
+            anomaly_df["window_end_ts"]
+        )
+        pages_df = _dedup_latest_per_page(anomaly_df, "sort_ts")
+        pages_df = pages_df.sort_values(by="sort_ts", ascending=False)
     else:
         anomaly_df = pd.DataFrame()
         pages_df = pd.DataFrame()
 
     if not anomaly_df.empty:
-        metric_a, metric_b, metric_c = st.columns(3)
+        metric_a, metric_b = st.columns(2)
         metric_a.metric("Unique pages", f"{len(pages_df):,}")
         metric_b.metric(
             "Anomaly messages read",
             f"{len(anomaly_df):,}",
-        )
-        metric_c.metric(
-            "Showing up to",
-            f"{ANOMALY_TABLE_MAX_ROWS}",
         )
         st.caption(
             "News confirmation is in the verified table below — use the "
@@ -612,20 +671,25 @@ def render_live_tables():
         if filtered_df.empty:
             st.info(f'No pages match "{page_filter}".')
         else:
-            display_df = filtered_df.head(ANOMALY_TABLE_MAX_ROWS).copy()
+            display_df = filtered_df.copy()
             display_df["wikipedia_url"] = display_df["page_title"].apply(
                 wikipedia_page_url
             )
-            display_df["detected_at"] = to_eastern(
-                display_df["window_end_ts"]
-            ).dt.strftime("%Y-%m-%d %H:%M ET")
+            display_df["last_edit_display"] = display_df["last_edit_ts"].apply(
+                lambda ts: (
+                    ts.tz_convert(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S ET")
+                    if pd.notna(ts)
+                    else "—"
+                )
+            )
 
+            table_height = int(min(800, max(200, 38 * len(display_df) + 40)))
             st.dataframe(
                 display_df[
                     [
                         "page_title",
                         "wikipedia_url",
-                        "detected_at",
+                        "last_edit_display",
                         "anomaly_score",
                         "edit_count",
                         "unique_editors",
@@ -636,7 +700,7 @@ def render_live_tables():
                     columns={
                         "page_title": "Page",
                         "wikipedia_url": "Wikipedia page",
-                        "detected_at": "Detected at (ET)",
+                        "last_edit_display": "Last edit (ET)",
                         "anomaly_score": "Anomaly score",
                         "edit_count": "Edits",
                         "unique_editors": "Editors",
@@ -646,6 +710,7 @@ def render_live_tables():
                 ),
                 hide_index=True,
                 use_container_width=True,
+                height=table_height,
                 column_config={
                     "Wikipedia page": st.column_config.LinkColumn(
                         "Wikipedia page", display_text="Open page"
@@ -658,14 +723,22 @@ def render_live_tables():
                     ),
                 },
             )
-            st.caption(
-                f"Showing {len(display_df)} of {len(filtered_df)} "
+            missing_edit_times = int(display_df["last_edit_ts"].isna().sum())
+            caption = (
+                f"{len(display_df)} "
                 f"{'filtered ' if page_filter else ''}"
                 f"unique page(s) "
                 f"({len(anomaly_df)} total anomaly messages read). "
-                "Use the filter to find a specific page (e.g. one listed "
-                "under verified matches below)."
+                "Last edit is the most recent Wikimedia edit time for that "
+                "page (from the anomaly window when available, otherwise "
+                "from this pipeline's captured edits)."
             )
+            if missing_edit_times:
+                caption += (
+                    f" {missing_edit_times} row(s) have no edit timestamp "
+                    "in Kafka or Parquet yet."
+                )
+            st.caption(caption)
     elif scorer_status.get("state") == "blocked":
         st.warning(
             "Anomaly detection is disabled because the model has not been "
@@ -769,8 +842,8 @@ def render_live_tables():
             # independently (often to the same news URL with a slightly
             # different similarity). Keep one row per page: the latest
             # window_end.
-            matched_df["window_end_ts"] = pd.to_datetime(
-                matched_df["window_end"], errors="coerce", utc=True
+            matched_df["window_end_ts"] = parse_anomaly_window_time(
+                matched_df["window_end"]
             )
             before_dedup = len(matched_df)
             matched_df = _dedup_latest_per_page(matched_df, "window_end_ts")
@@ -902,50 +975,97 @@ def render_live_tables():
         if "observed_at" in news_df.columns:
             news_df = news_df.sort_values("observed_at", ascending=False)
 
-        display_news = news_df.head(50).copy()
-        for time_column in ("gdelt_seen_at", "observed_at"):
-            if time_column in display_news.columns:
-                display_news[time_column] = display_news[time_column].dt.strftime(
-                    "%Y-%m-%d %H:%M ET"
+        if st.session_state.pop("gdelt_title_filter_clear", False):
+            st.session_state.gdelt_title_filter = ""
+
+        if "gdelt_title_filter" not in st.session_state:
+            st.session_state.gdelt_title_filter = ""
+
+        st.markdown("Filter by title")
+        gdelt_filter_col, gdelt_clear_col = st.columns(
+            [4, 1], vertical_alignment="bottom"
+        )
+        with gdelt_filter_col:
+            title_filter = st.text_input(
+                "Filter by title",
+                placeholder="e.g. Romell Glave",
+                key="gdelt_title_filter",
+                label_visibility="collapsed",
+            ).strip()
+        with gdelt_clear_col:
+            if st.button(
+                "Clear",
+                key="gdelt_title_filter_clear_btn",
+                use_container_width=True,
+                disabled=not bool(st.session_state.get("gdelt_title_filter")),
+            ):
+                st.session_state.gdelt_title_filter_clear = True
+                st.rerun()
+
+        filtered_news = news_df
+        if title_filter:
+            filtered_news = news_df[
+                news_df["title"]
+                .astype(str)
+                .str.contains(title_filter, case=False, na=False)
+            ]
+
+        if filtered_news.empty:
+            st.info(f'No articles match "{title_filter}".')
+        else:
+            display_news = filtered_news.copy()
+            for time_column in ("gdelt_seen_at", "observed_at"):
+                if time_column in display_news.columns:
+                    display_news[time_column] = display_news[
+                        time_column
+                    ].dt.strftime("%Y-%m-%d %H:%M ET")
+
+            display_columns = [
+                column
+                for column in (
+                    "title",
+                    "domain",
+                    "language",
+                    "gdelt_seen_at",
+                    "observed_at",
+                    "url",
                 )
+                if column in display_news.columns
+            ]
 
-        display_columns = [
-            column
-            for column in (
-                "title",
-                "domain",
-                "language",
-                "gdelt_seen_at",
-                "observed_at",
-                "url",
+            table_height = int(
+                min(800, max(200, 38 * len(display_news) + 40))
             )
-            if column in display_news.columns
-        ]
+            st.dataframe(
+                display_news[display_columns].rename(
+                    columns={
+                        "title": "Title",
+                        "domain": "Source",
+                        "language": "Language",
+                        "gdelt_seen_at": "GDELT crawled at (ET)",
+                        "observed_at": "Ingested at (ET)",
+                        "url": "URL",
+                    }
+                ),
+                hide_index=True,
+                use_container_width=True,
+                height=table_height,
+                column_config={
+                    "URL": st.column_config.LinkColumn(
+                        "URL", display_text="Open article"
+                    ),
+                },
+            )
 
-        st.dataframe(
-            display_news[display_columns].rename(
-                columns={
-                    "title": "Title",
-                    "domain": "Source",
-                    "language": "Language",
-                    "gdelt_seen_at": "GDELT crawled at (ET)",
-                    "observed_at": "Ingested at (ET)",
-                    "url": "URL",
-                }
-            ),
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "URL": st.column_config.LinkColumn("URL", display_text="Open article"),
-            },
-        )
-
-        st.caption(
-            f"Showing the 50 most recently ingested of {len(news_df)} "
-            "articles read from news-topic. \"GDELT crawled at\" is when "
-            "GDELT's crawler saw the URL — not the article's original "
-            "publication date. Times are US Eastern."
-        )
+            st.caption(
+                f"{len(display_news)} "
+                f"{'filtered ' if title_filter else ''}"
+                f"article(s) "
+                f"({len(news_df)} total read from news-topic). "
+                "\"GDELT crawled at\" is when GDELT's crawler saw the URL — "
+                "not the article's original publication date. Times are "
+                "US Eastern."
+            )
     elif gdelt_status.get("state") == "running":
         st.info(
             "The GDELT producer is running and waiting for data. GDELT "

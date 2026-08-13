@@ -235,7 +235,7 @@ Qualitative / quantitative checks from the windowed retrain session:
 
 News confirmation (`matched: true` on `anomaly-news-verdicts`) remains sparse
 by design: it requires concurrent topical overlap between a statistical edit
-burst and recent GDELT articles above `SIMILARITY_THRESHOLD` (default 0.7).
+burst and recent GDELT articles above `SIMILARITY_THRESHOLD` (default 0.65).
 (The topic was renamed from `verified-events` to reflect that it stores all
 verdicts, including `matched: false`.)
 
